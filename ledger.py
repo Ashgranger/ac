@@ -1,6 +1,9 @@
 """Fill-driven accounting + Level 6 Online Learning of Adverse Selection."""
 from __future__ import annotations
 
+import time
+import math
+
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
@@ -64,16 +67,18 @@ class OnlineLearner:
             "sweep_guard_window_s": Decimal(str(cfg.sweep_guard_window_s)),
         }
 
+        self._last_decay_ts: Optional[float] = None
+
         # Hard mathematical & safety bounds [min_val, max_val]
         self.bounds = {
-            "min_edge_bps": (Decimal("0.5"), Decimal("30.0")),
-            "max_edge_bps": (Decimal("5.0"), Decimal("80.0")),
+            "min_edge_bps": (Decimal("0.2"), Decimal("6.0")),
+            "max_edge_bps": (Decimal("2.0"), Decimal("20.0")),
             "skew_bps": (Decimal("0.5"), Decimal("35.0")),
-            "level_spacing_bps": (Decimal("1.0"), Decimal("25.0")),
+            "level_spacing_bps": (Decimal("1.0"), Decimal("15.0")),
             "level_size_mult": (Decimal("0.10"), Decimal("0.95")),
             "vol_k": (Decimal("0.1"), Decimal("4.0")),
-            "tox_mult": (Decimal("0.2"), Decimal("5.0")),
-            "min_ev_bps": (Decimal("0.05"), Decimal("4.0")),
+            "tox_mult": (Decimal("0.2"), Decimal("2.5")),
+            "min_ev_bps": (Decimal("0.05"), Decimal("0.40")),
             "obi_alpha": (Decimal("0.05"), Decimal("1.5")),
             "tfi_beta": (Decimal("0.05"), Decimal("2.0")),
             "fill_prob_kappa": (Decimal("0.05"), Decimal("1.5")),
@@ -193,6 +198,27 @@ class OnlineLearner:
     def sweep_guard_window_s(self) -> float:
         return float(self.params["sweep_guard_window_s"]) if self.enabled else float(self.base["sweep_guard_window_s"])
 
+    def tick_decay(self, now: float) -> None:
+        """Gradually relaxes learned parameters toward base config during idle/no-fill periods."""
+        if not self.enabled:
+            return
+        if self._last_decay_ts is None:
+            self._last_decay_ts = now
+            return
+        dt = now - self._last_decay_ts
+        if dt <= 0:
+            return
+        self._last_decay_ts = now
+
+        decay_factor = Decimal(str(math.exp(-dt / 45.0)))
+        for k in self.params:
+            if k in self.base:
+                diff = self.params[k] - self.base[k]
+                self.params[k] = self.base[k] + diff * decay_factor
+        self._clamp_all()
+
+    decay_idle = tick_decay
+
     def _clamp_all(self) -> None:
         for k in self.params:
             if k in self.bounds:
@@ -214,24 +240,24 @@ class OnlineLearner:
             self.n_toxic += 1
             severity = min(Decimal("3.0"), abs(m_bps) / Decimal("5.0"))
 
-            # 1. Widen quoting edges & ladder defenses
-            self.params["min_edge_bps"] += Decimal("0.30") * severity
-            self.params["max_edge_bps"] += Decimal("0.60") * severity
-            self.params["level_spacing_bps"] += Decimal("0.25") * severity
-            self.params["level_size_mult"] -= Decimal("0.03") * severity
+            # 1. Widen quoting edges & ladder defenses (bounded safely)
+            self.params["min_edge_bps"] += Decimal("0.20") * severity
+            self.params["max_edge_bps"] += Decimal("0.40") * severity
+            self.params["level_spacing_bps"] += Decimal("0.15") * severity
+            self.params["level_size_mult"] -= Decimal("0.02") * severity
 
             # 2. Sharpen toxicity scaling, momentum penalties & EV hurdle
-            self.params["tox_mult"] += Decimal("0.08") * severity
-            self.params["min_ev_bps"] += Decimal("0.04") * severity
-            self.params["regime_toxic_spread_mult"] += Decimal("0.05") * severity
-            self.params["trend_widen"] += Decimal("0.05") * severity
-            self.params["vol_k"] += Decimal("0.03") * severity
+            self.params["tox_mult"] += Decimal("0.05") * severity
+            self.params["min_ev_bps"] += Decimal("0.02") * severity
+            self.params["regime_toxic_spread_mult"] += Decimal("0.03") * severity
+            self.params["trend_widen"] += Decimal("0.03") * severity
+            self.params["vol_k"] += Decimal("0.02") * severity
 
             # 3. Increase exit profit expectation to recover adverse costs
-            self.params["exit_min_profit_bps"] += Decimal("0.10") * severity
+            self.params["exit_min_profit_bps"] += Decimal("0.05") * severity
 
             # 4. Tighten burst protection
-            self.params["burst_cooldown_s"] += Decimal("2.0") * severity
+            self.params["burst_cooldown_s"] += Decimal("1.5") * severity
 
             log.info("LEARN [ADVERSE MARKOUT %.2fbps] -> Widened min_edge=%.2fbps, spacing=%.2fbps, tox_mult=%.2f, min_ev=%.2fbps",
                      float(m_bps), float(self.params["min_edge_bps"]), float(self.params["level_spacing_bps"]),
@@ -239,7 +265,7 @@ class OnlineLearner:
         else:
             # Profitable, benign markout
             self.n_benign += 1
-            decay = Decimal("0.03")
+            decay = Decimal("0.10")
 
             self.params["min_edge_bps"] -= (self.params["min_edge_bps"] - self.base["min_edge_bps"]) * decay
             self.params["max_edge_bps"] -= (self.params["max_edge_bps"] - self.base["max_edge_bps"]) * decay
@@ -335,6 +361,7 @@ class OnlineLearner:
 
         data = {
             "version": 1,
+            "market": getattr(self.cfg, "market", "UNKNOWN"),
             "enabled": self.enabled,
             "total_updates": self.total_learned_updates,
             "n_markouts": self.n_markouts,
@@ -365,6 +392,12 @@ class OnlineLearner:
                 data = json.load(fp)
 
             if isinstance(data, dict) and "params" in data:
+                saved_market = data.get("market")
+                current_market = getattr(self.cfg, "market", None)
+                if saved_market and current_market and saved_market != current_market:
+                    log.info("Learned state was for %s, current market is %s — resetting to base configuration",
+                             saved_market, current_market)
+                    return False
                 for k, v in data["params"].items():
                     if k in self.params:
                         self.params[k] = Decimal(str(v))
@@ -401,6 +434,7 @@ class Ledger:
         self.markouts_buy: deque = deque(maxlen=cfg.markout_window)
         self.markouts_sell: deque = deque(maxlen=cfg.markout_window)
         self._mismatch = 0
+        self.last_now: float = time.time()
         self.learner = OnlineLearner(cfg)
 
     def is_flat(self, mid: Decimal, min_notional: Decimal) -> bool:
@@ -462,27 +496,58 @@ class Ledger:
         elif now_flat:
             self.opened_ts = None
 
+        self.last_now = now
         f = Fill(now, side, qty, price, mid, edge_bps, self.position, realized_delta)
         self.fills.append(f)
         self._pending_markouts.append((now + self.cfg.markout_horizon_s, f, self.cfg.markout_horizon_s))
         self.learner.on_fill(side, price, mid, self.position * mid, self.hold_s(now))
         return f
 
+    def _now(self) -> float:
+        if hasattr(self, "current_now") and self.current_now is not None:
+            return float(self.current_now)
+        if hasattr(self, "last_now") and self.last_now is not None:
+            return float(self.last_now)
+        return time.time()
+
+    def _calc_weighted_markout(self, buf: deque) -> Decimal:
+        if not buf:
+            return ZERO
+        weighted_sum = ZERO
+        weight_total = ZERO
+        now = self._now()
+        for item in buf:
+            if isinstance(item, tuple):
+                ts, val = item
+                dt = max(0.0, float(now) - float(ts))
+                if dt >= 60.0:
+                    continue
+                w = Decimal(str(math.exp(-dt / 25.0)))
+            else:
+                val = item
+                w = ONE
+            weighted_sum += val * w
+            weight_total += w
+        if weight_total < Decimal("0.01"):
+            return ZERO
+        return weighted_sum / weight_total
+
     def process_markouts(self, mid: Decimal, now: float) -> None:
+        self.last_now = now
         while self._pending_markouts and self._pending_markouts[0][0] <= now:
             _, f, horizon = self._pending_markouts.pop(0)
             m = (mid - f.price) if f.side == BUY else (f.price - mid)
             m_bps = m / f.price * BPS
-            self.markouts.append(m_bps)
+            self.markouts.append((now, m_bps))
             if f.side == BUY:
-                self.markouts_buy.append(m_bps)
+                self.markouts_buy.append((now, m_bps))
             else:
-                self.markouts_sell.append(m_bps)
+                self.markouts_sell.append((now, m_bps))
             self.learner.on_markout(m_bps, f.side, self.tox_bps)
 
     @property
     def avg_markout_bps(self) -> Decimal:
-        return sum(self.markouts, ZERO) / len(self.markouts) if self.markouts else ZERO
+        return self._calc_weighted_markout(self.markouts)
 
     @property
     def tox_bps(self) -> Decimal:
@@ -494,7 +559,7 @@ class Ledger:
         buf = self.markouts_buy if side == BUY else self.markouts_sell
         if not buf:
             return self.tox_bps
-        avg_m = sum(buf, ZERO) / len(buf)
+        avg_m = self._calc_weighted_markout(buf)
         return max(ZERO, -avg_m)
 
     def reconcile(self, ex_pos: Decimal, now: float, mid: Decimal, min_notional: Decimal) -> bool:

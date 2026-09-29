@@ -47,6 +47,7 @@ class OrderManager:
         self._reject_n = {BUY: 0, SELL: 0}
         self._actions: deque = deque()
         self.paused_until = 0.0
+        self._recently_closed: deque = deque(maxlen=200)
         self._consec_errors = 0
         self.last_place_ts = 0.0
         self.maybe_orders = True
@@ -149,6 +150,7 @@ class OrderManager:
         if o.cancelling_since is not None and now - o.cancelling_since < 5:
             return
         o.cancelling_since = now
+        self._recently_closed.append((now, o.order_id))
         self._budget(now)
         resp = await self.ex.write(self.signer.cancel(self.get_market(), o.order_id))
         if self.cfg.dry_run or "ORDER_NOT_FOUND" in json.dumps(resp):
@@ -162,6 +164,7 @@ class OrderManager:
     def _remove_order(self, order_id: str) -> None:
         o = self.orders.pop(order_id, None)
         if o:
+            self._recently_closed.append((time.time(), order_id))
             slot = (o.pair_index, o.side)
             if self.pair_slots.get(slot) == order_id:
                 self.pair_slots.pop(slot, None)
@@ -277,7 +280,9 @@ class OrderManager:
         mine = set(self.orders)
         if now - self.last_place_ts < 3:
             return
-        for oid in open_ids - mine:
+        recent_closed = {oid for ts, oid in self._recently_closed if now - ts < 15.0}
+        for oid in (open_ids - mine - recent_closed):
             if oid and oid != "None":
+                self._recently_closed.append((now, oid))
                 log.warning("cancelling orphan order %s", oid)
                 await self.ex.write(self.signer.cancel(self.get_market(), oid))

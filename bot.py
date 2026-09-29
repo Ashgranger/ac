@@ -97,7 +97,7 @@ class MarketMaker:
             elif isinstance(contents, dict):
                 self._handle_trade(contents, now)
 
-        elif channel == "orderBook":
+        elif channel in ("l2Orderbook", "l2OrderbookUpdates", "orderBook"):
             if isinstance(contents, dict):
                 bids = contents.get("bids") or []
                 asks = contents.get("asks") or []
@@ -189,6 +189,10 @@ class MarketMaker:
     async def tick(self) -> None:
         async with self._tick_lock:
             now = self.now()
+            self.ledger.last_now = now
+            self.ledger.current_now = now
+            if hasattr(self.ledger, "learner"):
+                self.ledger.learner.tick_decay(now)
             m = self.md.info
             if not m:
                 return
@@ -339,7 +343,7 @@ class MarketMaker:
             reader_task = asyncio.create_task(self.ex.reader())
 
             await self.ex.subscribe("bbo", self.cfg.market)
-            await self.ex.subscribe("orderBook", self.cfg.market)
+            await self.ex.subscribe("l2Orderbook", self.cfg.market)
             await self.ex.subscribe("trades", self.cfg.market)
             await self.ex.subscribe("orders", self.cfg.address)
             await self.ex.subscribe("userFills", self.cfg.address)

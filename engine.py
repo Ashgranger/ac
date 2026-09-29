@@ -131,8 +131,6 @@ class MarketMakingEngine:
         is_toxic = (regime == "REGIME_D_TOXIC")
         
         base_edge_bps = min_edge + vol_k * md.vol_bps
-        if self.cfg.enable_online_learning:
-            base_edge_bps += tox_mult * ledger.tox_bps
         if is_toxic:
             base_edge_bps = base_edge_bps * tox_spread_mult
         base_edge_bps = clamp(base_edge_bps, min_edge, max_edge)
@@ -152,8 +150,9 @@ class MarketMakingEngine:
 
         buy_tox = ledger.side_tox_bps(BUY)
         sell_tox = ledger.side_tox_bps(SELL)
-        buy_tox_penalty = buy_tox * tox_mult if self.cfg.enable_online_learning else ZERO
-        sell_tox_penalty = sell_tox * tox_mult if self.cfg.enable_online_learning else ZERO
+        max_tox_addon = Decimal("2.5")
+        buy_tox_penalty = min(max_tox_addon, buy_tox * tox_mult) if self.cfg.enable_online_learning else ZERO
+        sell_tox_penalty = min(max_tox_addon, sell_tox * tox_mult) if self.cfg.enable_online_learning else ZERO
 
         quotes: List[QuoteTarget] = []
         stress_loss_limit = l.stress_loss_bps if l else self.cfg.stress_loss_bps
@@ -218,7 +217,7 @@ class MarketMakingEngine:
                         ))
             else:
                 # ADDING LONG: Quote as long as inventory has room and side is not blocked
-                severe_sell_pressure = (flow_bias < Decimal("-0.50") or (is_toxic and md.obi < Decimal("-0.35")))
+                severe_sell_pressure = (flow_bias < Decimal("-0.50") or (is_toxic and md.obi < Decimal("-0.55")))
                 toxic_extra_level = (is_toxic and k > 0)
                 # INVENTORY ROTATION & ANTI-CHASING: If already long, suppress touch L0 buy!
                 already_long = (pos_usd >= self.cfg.order_usd * Decimal("0.5"))
@@ -248,7 +247,7 @@ class MarketMakingEngine:
                             
                             ev_bps = Decimal(str(p_fill)) * (capture_bps - adv_bps) - fee_bps - inv_cost_bps
                             
-                            min_ev = max(ZERO, min_ev_base - Decimal("0.5")) if (existing_slots and (k, BUY) in existing_slots) else min_ev_base
+                            min_ev = max(ZERO, min_ev_base - self.cfg.ev_hysteresis_bps) if (existing_slots and (k, BUY) in existing_slots) else min_ev_base
 
                             if (not self.cfg.enable_adaptive_ev) or (ev_bps >= min_ev):
                                 quotes.append(QuoteTarget(
@@ -294,7 +293,7 @@ class MarketMakingEngine:
                         ))
             else:
                 # ADDING SHORT: Quote as long as inventory has room and side is not blocked
-                severe_buy_pressure = (flow_bias > Decimal("0.50") or (is_toxic and md.obi > Decimal("0.35")))
+                severe_buy_pressure = (flow_bias > Decimal("0.50") or (is_toxic and md.obi > Decimal("0.55")))
                 toxic_extra_level = (is_toxic and k > 0)
                 # INVENTORY ROTATION & ANTI-CHASING: If already short, suppress touch L0 sell!
                 already_short = (-pos_usd >= self.cfg.order_usd * Decimal("0.5"))
@@ -324,7 +323,7 @@ class MarketMakingEngine:
                             
                             ev_bps = Decimal(str(p_fill)) * (capture_bps - adv_bps) - fee_bps - inv_cost_bps
                             
-                            min_ev = max(ZERO, min_ev_base - Decimal("0.5")) if (existing_slots and (k, SELL) in existing_slots) else min_ev_base
+                            min_ev = max(ZERO, min_ev_base - self.cfg.ev_hysteresis_bps) if (existing_slots and (k, SELL) in existing_slots) else min_ev_base
 
                             if (not self.cfg.enable_adaptive_ev) or (ev_bps >= min_ev):
                                 quotes.append(QuoteTarget(

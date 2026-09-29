@@ -37,6 +37,7 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         await sim.step(bot, s, clock, "80000.0", "80100.0", bsz="1", asz="1")
         initial_ask = bot.om.get_order_by_slot(0, SELL)
         self.assertIsNotNone(initial_ask, "Initial ask should be present in balanced market")
+        initial_ask_price = initial_ask.price
 
         # Heavy bid pressure arrives: bid size = 10, ask size = 0.5 (microprice pumps toward ask)
         await sim.step(bot, s, clock, "80000.0", "80100.0", bsz="10", asz="0.5")
@@ -45,7 +46,7 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         if new_ask is None:
             print("✓ test_02_orderbook_intelligence passed: Toxic ask pulled completely (EV < 0 protection).")
         else:
-            self.assertGreater(new_ask.price, initial_ask.price, "Ask should reprice higher to protect against toxic buying")
+            self.assertGreater(new_ask.price, initial_ask_price, "Ask should reprice higher to protect against toxic buying")
             print(f"✓ test_02_orderbook_intelligence passed: Ask lifted from {initial_ask.price} to {new_ask.price}.")
 
     async def test_03_adaptive_ev_filter(self):
@@ -274,6 +275,44 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(getattr(l, param))
 
         print("✓ test_11_adverse_fill_avoidance_and_full_env_learning passed: Adverse fills avoided and full env learned.")
+
+    async def test_12_learning_decay_and_paralysis_recovery(self):
+        """Test that online learner and toxicity smoothly decay to prevent indefinite quote paralysis."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=1, ORDER_USD=20, MAX_POSITION_USD=200,
+                                 ENABLE_ONLINE_LEARNING=1, MARKOUT_HORIZON_S=1.0)
+
+        # 1. Neutral step
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        initial_edge = bot.ledger.learner.min_edge_bps
+
+        # 2. Simulate adverse markout on a round trip
+        fill1 = bot.ledger.on_fill(BUY, D("0.00025"), D("80000.0"), D("80040.0"), clock.t, D("5"))
+        fill2 = bot.ledger.on_fill(SELL, D("0.00025"), D("79950.0"), D("79950.0"), clock.t, D("5"))
+        clock.t += 1.5
+        bot.ledger.process_markouts(D("79900.0"), clock.t)
+
+        widened_edge = bot.ledger.learner.min_edge_bps
+        self.assertGreater(widened_edge, initial_edge, "Adverse markout should widen edge")
+        self.assertGreater(bot.ledger.tox_bps, D("0"), "Toxicity should be positive")
+
+        # 3. Fast-forward time by 100 seconds without fills (calm market)
+        for _ in range(20):
+            clock.t += 5.0
+            bot.ledger.current_now = clock.t
+            bot.ledger.learner.tick_decay(clock.t)
+            await bot.tick()
+
+        recovered_edge = bot.ledger.learner.min_edge_bps
+        recovered_tox = bot.ledger.tox_bps
+        self.assertLess(recovered_edge, widened_edge, "Learned edge must mean-revert toward base")
+        self.assertEqual(recovered_tox, D("0"), "Toxicity must decay to 0 after extended calm")
+
+        # 4. Verify quotes actively participate near the touch
+        b0 = bot.om.get_order_by_slot(0, BUY)
+        s0 = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(b0, "Touch BUY should be active when flat")
+        self.assertIsNotNone(s0, "Touch SELL should be active when flat")
+        print("✓ test_12_learning_decay_and_paralysis_recovery passed: Decay and active quote recovery verified.")
 
 
 if __name__ == "__main__":
