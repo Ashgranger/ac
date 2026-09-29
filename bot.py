@@ -62,7 +62,6 @@ class MarketMaker:
         self._last_pause_log = {"rth": 0.0, "spread": 0.0, "oracle": 0.0, "jump": 0.0}
         self._last_status = 0.0
         self._last_info_fetch = 0.0
-        self._last_logged_realized: Decimal = ZERO
         self._tick_lock = asyncio.Lock()
         self._dirty_evt = asyncio.Event()
 
@@ -317,29 +316,12 @@ class MarketMaker:
         if self.cfg.enable_online_learning:
             s = self.ledger.learner.get_summary()
             p = s["params"]
-            realized_delta = self.ledger.realized - self._last_logged_realized
-            self._last_logged_realized = self.ledger.realized
-            inv_pnl = self.ledger.inventory_pnl(mid)
-            reason = s.get("last_change_reason", "none") or "none"
-
-            m1s = (f"{float(self.ledger.avg_markout_1s_bps):+.2f}bps") if self.ledger.markouts_1s else "0.00bps"
-            m5s = (f"{float(self.ledger.avg_markout_5s_bps):+.2f}bps") if self.ledger.markouts_5s else "0.00bps"
-            m_avg = (f"{float(self.ledger.avg_markout_bps):+.2f}bps") if self.ledger.markouts else "0.00bps"
-            wr = f"{s['win_rate']:.1f}%"
-            afr = f"{s['adverse_fill_rate']:.1f}%"
-            pnl_delta = ("+$" if realized_delta >= 0 else "-$") + f"{abs(float(realized_delta)):.2f}"
-            inv_pnl_str = ("+$" if inv_pnl >= 0 else "-$") + f"{abs(float(inv_pnl)):.2f}"
-            cap_spr = f"${float(self.ledger.spread_capture):.2f} (avg {float(self.ledger.avg_edge_bps):.2f}bps)"
-            vol_str = f"${float(self.ledger.volume_usd):.2f}"
-            fills_str = f"{self.ledger.n_fills} ({self.ledger.n_buys}B/{self.ledger.n_sells}S)"
-
-            log.info("LEARN [updates=%d tox=%d] | edge=%.2f-%.2fbps skew=%.2fbps spacing=%.2fbps mult=%.2f vol_k=%.2f tox_mult=%.2f min_ev=%.2fbps obi_a=%.2f tfi_b=%.2f kappa=%.2f | markout_1s=%s markout_5s=%s avg_markout=%s | win_rate=%s adverse_fill_rate=%s | realized_pnl_delta=%s inventory_pnl=%s | capture_spread=%s volume=%s fills=%s | reason=%s",
+            log.info("LEARN [updates=%d tox=%d] | edge=%.2f-%.2fbps skew=%.2fbps spacing=%.2fbps mult=%.2f vol_k=%.2f tox_mult=%.2f min_ev=%.2fbps obi_a=%.2f tfi_b=%.2f kappa=%.2f",
                      s["total_updates"], s["toxic_fills"],
                      float(p["min_edge_bps"]), float(p["max_edge_bps"]), float(p["skew_bps"]),
                      float(p["level_spacing_bps"]), float(p["level_size_mult"]), float(p["vol_k"]),
                      float(p["tox_mult"]), float(p["min_ev_bps"]), float(p["obi_alpha"]),
-                     float(p["tfi_beta"]), float(p["fill_prob_kappa"]),
-                     m1s, m5s, m_avg, wr, afr, pnl_delta, inv_pnl_str, cap_spr, vol_str, fills_str, reason)
+                     float(p["tfi_beta"]), float(p["fill_prob_kappa"]))
 
     async def run(self) -> None:
         log.info("Connecting to %s Arcus WS (%s)...", self.cfg.env_name, self.ex.ws_url)
