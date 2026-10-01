@@ -62,6 +62,7 @@ class MarketMaker:
         self._last_pause_log = {"rth": 0.0, "spread": 0.0, "oracle": 0.0, "jump": 0.0}
         self._last_status = 0.0
         self._last_info_fetch = 0.0
+        self._last_logged_realized: Decimal = ZERO
         self._tick_lock = asyncio.Lock()
         self._dirty_evt = asyncio.Event()
 
@@ -103,6 +104,16 @@ class MarketMaker:
                 asks = contents.get("asks") or []
                 self.md.on_depth(bids, asks, now)
 
+        elif channel in ("external_bbo", "cross_venue"):
+            if isinstance(contents, dict):
+                venue = contents.get("venue", "EXTERNAL")
+                bid = Decimal(str(contents["bid"]))
+                ask = Decimal(str(contents["ask"]))
+                bid_sz = Decimal(str(contents.get("bid_size", "1")))
+                ask_sz = Decimal(str(contents.get("ask_size", "1")))
+                self.md.update_cross_venue(venue, bid, ask, bid_sz, ask_sz, now)
+                self._dirty_evt.set()
+
         elif channel == "orders":
             if isinstance(contents, list):
                 for row in contents:
@@ -123,6 +134,21 @@ class MarketMaker:
                         signed_pos = sz if side == "LONG" else (-sz if side == "SHORT" else ZERO)
                         self.ledger.reconcile(signed_pos, now, target_mid, m.min_notional)
 
+        elif channel in ("funding", "funding_rate", "fundingRate"):
+            if isinstance(contents, dict):
+                r = Decimal(str(contents.get("rate") or contents.get("fundingRate") or "0"))
+                if self.md.info:
+                    self.md.info.funding_rate = r
+                self.md.funding_rate = r
+                pmt = Decimal(str(contents.get("payment") or contents.get("fundingPayment") or "0"))
+                if pmt != ZERO:
+                    self.ledger.apply_funding(pmt)
+
+    def on_external_venue_bbo(self, venue: str, bid: Decimal, ask: Decimal,
+                              bid_sz: Decimal = Decimal("1"), ask_sz: Decimal = Decimal("1")) -> None:
+        self.md.update_cross_venue(venue, bid, ask, bid_sz, ask_sz, self.now())
+        self._dirty_evt.set()
+
     def _handle_trade(self, tr: dict, now: float) -> None:
         try:
             side = str(tr.get("side") or tr.get("orderSide") or "BUY").upper()
@@ -139,7 +165,8 @@ class MarketMaker:
         mid = self.md.mid or price
         min_notional = m.min_notional if m else Decimal("5")
         
-        fill = self.ledger.on_fill(side, qty, price, mid, now, min_notional)
+        is_maker = not getattr(o, "is_taker", False)
+        fill = self.ledger.on_fill(side, qty, price, mid, now, min_notional, is_maker=is_maker)
         log.info("FILL L%d %s %s @ %s | edge=%sbps pos=%s pnl=$%s",
                  o.pair_index, side, fmt(qty), fmt(price), fmt(fill.edge_bps),
                  fmt(self.ledger.position), fmt(self.ledger.total_pnl(mid)))
@@ -186,12 +213,46 @@ class MarketMaker:
         except Exception:
             pass
 
+    def _log_quote_opportunity(self, targets: list[QuoteTarget], now: float) -> None:
+        if not getattr(self.cfg, "enable_quote_dataset", False) or not self.cfg.quote_dataset_path:
+            return
+        if self.cfg.quote_dataset_path == os.devnull:
+            return
+        try:
+            snapshot = self.md.get_microstructure_snapshot(self.md.info, now)
+            record = {
+                "ts": now,
+                "snapshot": snapshot,
+                "position": float(self.ledger.position),
+                "avg_cost": float(self.ledger.avg_cost),
+                "unrealized_pnl": float(self.ledger.unrealized(self.md.mid or Decimal(0))),
+                "realized_pnl": float(self.ledger.realized),
+                "quotes": [
+                    {
+                        "pair_index": q.pair_index,
+                        "side": q.side,
+                        "price": float(q.price),
+                        "qty": float(q.qty),
+                        "ev_bps": float(q.expected_value_bps),
+                        "p_fill": float(q.fill_probability),
+                        "is_exit": q.is_exit_quote,
+                        "is_taker": getattr(q, "is_taker", False)
+                    }
+                    for q in targets
+                ]
+            }
+            with open(self.cfg.quote_dataset_path, "a") as fp:
+                fp.write(json.dumps(record) + chr(10))
+        except Exception:
+            pass
+
     async def tick(self) -> None:
         async with self._tick_lock:
             now = self.now()
             self.ledger.last_now = now
             self.ledger.current_now = now
-            if hasattr(self.ledger, "learner"):
+            if hasattr(self.ledger, "learner") and (now - getattr(self, "_last_decay_call", 0.0) >= 1.0):
+                self._last_decay_call = now
                 self.ledger.learner.tick_decay(now)
             m = self.md.info
             if not m:
@@ -233,12 +294,19 @@ class MarketMaker:
                                 m.name)
                 return
 
+            pos_usd = self.ledger.position * mid
             if self.md.jump_active(now):
-                await self.om.cancel_all()
-                if now - self._last_pause_log["jump"] > 30.0:
-                    self._last_pause_log["jump"] = now
-                    log.warning("Price jump detected - Quoting paused for %ss cooldown", self.cfg.jump_cooldown_s)
-                return
+                if pos_usd == ZERO:
+                    await self.om.cancel_all()
+                    if now - self._last_pause_log["jump"] > 30.0:
+                        self._last_pause_log["jump"] = now
+                        log.warning("Price jump detected - Quoting paused for %ss cooldown", self.cfg.jump_cooldown_s)
+                    return
+                else:
+                    if pos_usd > ZERO:
+                        self._trend_blocked_until[BUY] = now + self.cfg.jump_cooldown_s
+                    else:
+                        self._trend_blocked_until[SELL] = now + self.cfg.jump_cooldown_s
 
             buy_blocked = (now < self._burst_blocked_until[BUY] or now < self._trend_blocked_until[BUY])
             sell_blocked = (now < self._burst_blocked_until[SELL] or now < self._trend_blocked_until[SELL])
@@ -271,6 +339,7 @@ class MarketMaker:
             targets = self.engine.generate_ladder_quotes(
                 m, self.md, self.ledger, now, buy_blocked, sell_blocked, existing_slots=existing_slots
             )
+            self._log_quote_opportunity(targets, now)
 
             blocked_sides = set()
             if buy_blocked:
@@ -316,12 +385,29 @@ class MarketMaker:
         if self.cfg.enable_online_learning:
             s = self.ledger.learner.get_summary()
             p = s["params"]
-            log.info("LEARN [updates=%d tox=%d] | edge=%.2f-%.2fbps skew=%.2fbps spacing=%.2fbps mult=%.2f vol_k=%.2f tox_mult=%.2f min_ev=%.2fbps obi_a=%.2f tfi_b=%.2f kappa=%.2f",
+            realized_delta = self.ledger.realized - self._last_logged_realized
+            self._last_logged_realized = self.ledger.realized
+            inv_pnl = self.ledger.inventory_pnl(mid)
+            reason = s.get("last_change_reason", "none") or "none"
+
+            m1s = (f"{float(self.ledger.avg_markout_1s_bps):+.2f}bps") if self.ledger.markouts_1s else "0.00bps"
+            m5s = (f"{float(self.ledger.avg_markout_5s_bps):+.2f}bps") if self.ledger.markouts_5s else "0.00bps"
+            m_avg = (f"{float(self.ledger.avg_markout_bps):+.2f}bps") if self.ledger.markouts else "0.00bps"
+            wr = f"{s['win_rate']:.1f}%"
+            afr = f"{s['adverse_fill_rate']:.1f}%"
+            pnl_delta = ("+$" if realized_delta >= 0 else "-$") + f"{abs(float(realized_delta)):.2f}"
+            inv_pnl_str = ("+$" if inv_pnl >= 0 else "-$") + f"{abs(float(inv_pnl)):.2f}"
+            cap_spr = f"${float(self.ledger.spread_capture):.2f} (avg {float(self.ledger.avg_edge_bps):.2f}bps)"
+            vol_str = f"${float(self.ledger.volume_usd):.2f}"
+            fills_str = f"{self.ledger.n_fills} ({self.ledger.n_buys}B/{self.ledger.n_sells}S)"
+
+            log.info("LEARN [updates=%d tox=%d] | edge=%.2f-%.2fbps skew=%.2fbps spacing=%.2fbps mult=%.2f vol_k=%.2f tox_mult=%.2f min_ev=%.2fbps obi_a=%.2f tfi_b=%.2f kappa=%.2f | markout_1s=%s markout_5s=%s avg_markout=%s | win_rate=%s adverse_fill_rate=%s | realized_pnl_delta=%s inventory_pnl=%s | capture_spread=%s volume=%s fills=%s",
                      s["total_updates"], s["toxic_fills"],
                      float(p["min_edge_bps"]), float(p["max_edge_bps"]), float(p["skew_bps"]),
                      float(p["level_spacing_bps"]), float(p["level_size_mult"]), float(p["vol_k"]),
                      float(p["tox_mult"]), float(p["min_ev_bps"]), float(p["obi_alpha"]),
-                     float(p["tfi_beta"]), float(p["fill_prob_kappa"]))
+                     float(p["tfi_beta"]), float(p["fill_prob_kappa"]),
+                     m1s, m5s, m_avg, wr, afr, pnl_delta, inv_pnl_str, cap_spr, vol_str, fills_str)
 
     async def run(self) -> None:
         log.info("Connecting to %s Arcus WS (%s)...", self.cfg.env_name, self.ex.ws_url)

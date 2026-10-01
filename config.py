@@ -27,6 +27,22 @@ def _b(name: str, default: str) -> bool:
     return str(_e(name, default)).lower() in ("1", "true", "yes", "y", "on")
 
 
+
+def _parse_guarantee_spread_capture(name: str, default: str) -> tuple[bool, Decimal]:
+    v = _e(name, default)
+    s = str(v).strip().lower()
+    if s in ("0", "false", "no", "off"):
+        return False, Decimal("0")
+    try:
+        d = Decimal(str(v).strip())
+        if d > 0:
+            return True, d
+    except Exception:
+        pass
+    if s in ("1", "true", "yes", "on"):
+        return True, Decimal("0.5")
+    return False, Decimal("0")
+
 @dataclass
 class Config:
     # --- connection -------------------------------------------------------- #
@@ -94,6 +110,46 @@ class Config:
     ev_hysteresis_bps: Decimal
     learning_state_path: str
 
+    # --- Cross-Exchange & Lead/Lag Intelligence ---------------------------- #
+    enable_cross_exchange: bool
+    cross_lead_lag_weight: Decimal
+    cross_dispersion_widen_mult: Decimal
+    cross_velocity_threshold_bps: Decimal
+    guarantee_spread_capture: bool
+    guarantee_spread_capture_bps: Decimal
+    aggressive_touch: bool
+    touch_min_requote_s: float
+    use_depth_imbalance: bool
+    imbalance_levels: int
+    imbalance_widen_bps: Decimal
+    imbalance_size_cut: Decimal
+    continue_add_after_reduce: bool
+    run_tag: str
+    markout_horizons_s: str
+
+    # --- Inventory Risk Management & Taker Loss Cut ------------------------ #
+    enable_smart_inventory_mgmt: bool
+    taker_fee_bps: Decimal
+    emergency_taker_loss_bps: Decimal
+    emergency_taker_score_threshold: Decimal
+
+    # --- Level 8 Tight-Spread & Queue-Aware Models ------------------------- #
+    enable_selective_touch: bool
+    enable_queue_model: bool
+    queue_horizon_s: float
+    enable_funding_carry: bool
+    funding_weight: Decimal
+    enable_fragility_guard: bool
+    fragility_threshold: Decimal
+    enable_exhaustion_detection: bool
+    queue_reset_cost_bps: Decimal
+    enable_absorption_mode: bool
+    enable_onesided_touch: bool
+    enable_quote_dataset: bool
+    quote_dataset_path: str
+    enable_empirical_learner: bool
+    empirical_prior_weight: int
+
     # --- risk -------------------------------------------------------------- #
     session_max_loss_usd: Decimal
     halt_exit: bool
@@ -126,6 +182,7 @@ class Config:
             raise Fatal("ARCUS_API_SIGNING_KEY must be the 64-hex Ed25519 private key")
         dry = _b("DRY_RUN", "1")
         market = str(_e("MARKET", "BTC-USD"))
+        guar_sc, guar_sc_bps = _parse_guarantee_spread_capture("GUARANTEE_SPREAD_CAPTURE", "1")
         cfg = cls(
             env_name=env_name, address=address, signing_key=key,
             account_index=int(_e("ARCUS_ACCOUNT_INDEX", 0)), market=market, dry_run=dry,
@@ -174,6 +231,40 @@ class Config:
             regime_toxic_spread_mult=_d("REGIME_TOXIC_SPREAD_MULT", "1.5"),
             ev_hysteresis_bps=_d("EV_HYSTERESIS_BPS", "0.1"),
             learning_state_path=str(_e("LEARNING_STATE_PATH", "learning_state.json")),
+            enable_cross_exchange=_b("ENABLE_CROSS_EXCHANGE", "1"),
+            cross_lead_lag_weight=_d("CROSS_LEAD_LAG_WEIGHT", "0.5"),
+            cross_dispersion_widen_mult=_d("CROSS_DISPERSION_WIDEN_MULT", "1.5"),
+            cross_velocity_threshold_bps=_d("CROSS_VELOCITY_THRESHOLD_BPS", "1.5"),
+            guarantee_spread_capture=guar_sc,
+            guarantee_spread_capture_bps=guar_sc_bps,
+            aggressive_touch=_b("AGGRESSIVE_TOUCH", "1"),
+            touch_min_requote_s=float(_e("TOUCH_MIN_REQUOTE_S", "0.2")),
+            use_depth_imbalance=_b("USE_DEPTH_IMBALANCE", "1"),
+            imbalance_levels=int(_e("IMBALANCE_LEVELS", "7")),
+            imbalance_widen_bps=_d("IMBALANCE_WIDEN_BPS", "4.0"),
+            imbalance_size_cut=_d("IMBALANCE_SIZE_CUT", "0.3"),
+            continue_add_after_reduce=_b("CONTINUE_ADD_AFTER_REDUCE", "1"),
+            run_tag=str(_e("RUN_TAG", "default")),
+            markout_horizons_s=str(_e("MARKOUT_HORIZONS_S", "1,5,30")),
+            enable_smart_inventory_mgmt=_b("ENABLE_SMART_INVENTORY_MGMT", "1"),
+            taker_fee_bps=_d("TAKER_FEE_BPS", "2.2"),
+            emergency_taker_loss_bps=_d("EMERGENCY_TAKER_LOSS_BPS", "6.0"),
+            emergency_taker_score_threshold=_d("EMERGENCY_TAKER_SCORE_THRESHOLD", "2.5"),
+            enable_selective_touch=_b("ENABLE_SELECTIVE_TOUCH", "1"),
+            enable_queue_model=_b("ENABLE_QUEUE_MODEL", "1"),
+            queue_horizon_s=float(_e("QUEUE_HORIZON_S", 2.0)),
+            enable_funding_carry=_b("ENABLE_FUNDING_CARRY", "1"),
+            funding_weight=_d("FUNDING_WEIGHT", "0.5"),
+            enable_fragility_guard=_b("ENABLE_FRAGILITY_GUARD", "1"),
+            fragility_threshold=_d("FRAGILITY_THRESHOLD", "0.60"),
+            enable_exhaustion_detection=_b("ENABLE_EXHAUSTION_DETECTION", "1"),
+            queue_reset_cost_bps=_d("QUEUE_RESET_COST_BPS", "0.20"),
+            enable_absorption_mode=_b("ENABLE_ABSORPTION_MODE", "1"),
+            enable_onesided_touch=_b("ENABLE_ONESIDED_TOUCH", "1"),
+            enable_quote_dataset=_b("ENABLE_QUOTE_DATASET", "1"),
+            quote_dataset_path=str(_e("QUOTE_DATASET_PATH", f"quotes_{'paper' if dry else 'live'}_{market}.jsonl")),
+            enable_empirical_learner=_b("ENABLE_EMPIRICAL_LEARNER", "1"),
+            empirical_prior_weight=int(_e("EMPIRICAL_PRIOR_WEIGHT", 5)),
             session_max_loss_usd=_d("SESSION_MAX_LOSS_USD", "0.35"),
             halt_exit=_b("HALT_EXIT", "1"),
             requote_bps=_d("REQUOTE_BPS", "1"),

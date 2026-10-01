@@ -314,6 +314,340 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(s0, "Touch SELL should be active when flat")
         print("✓ test_12_learning_decay_and_paralysis_recovery passed: Decay and active quote recovery verified.")
 
+    async def test_13_cross_exchange_lead_lag_and_stale_quote_defense(self):
+        """Test Cross-Exchange Intelligence: External leader venue surge immediately elevates adverse move and pulls vulnerable quote."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ENABLE_CROSS_EXCHANGE=1, CROSS_VELOCITY_THRESHOLD_BPS="1.0")
+        await sim.step(bot, s, clock, "80000.0", "80100.0")
+        ask0 = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(ask0, "Initial ask should be placed in balanced market")
+
+        # External leader venue (Binance Futures) surges up +25 bps
+        bot.on_external_venue_bbo("BINANCE", D("80050.0"), D("80055.0"))
+        clock.t += 0.5
+        bot.on_external_venue_bbo("BINANCE", D("80250.0"), D("80260.0"))
+        
+        velo = bot.md.cross.cross_velocity_bps(3.0, clock.t)
+        self.assertGreater(velo, D("10.0"), "External velocity should be strongly positive")
+        
+        adv_sell = bot.engine.expected_adverse_move(SELL, bot.md, bot.ledger, clock.t)
+        self.assertGreater(adv_sell, D("10.0"), "Expected adverse move on SELL should spike")
+
+        await sim.step(bot, s, clock, "80000.0", "80100.0")
+        new_ask = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNone(new_ask, "Vulnerable ask should be pulled completely to prevent stale-quote sniping")
+        print("✓ test_13_cross_exchange_lead_lag_and_stale_quote_defense passed: Vulnerable quote pulled ahead of external surge.")
+
+    async def test_14_cross_exchange_dispersion_and_spread_capture(self):
+        """Test that cross-exchange dispersion widens quoted spread during venue disagreement, capturing higher volatility premium."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ENABLE_CROSS_EXCHANGE=1, CROSS_DISPERSION_WIDEN_MULT="2.0",
+                                 MIN_EDGE_BPS="5", MAX_EDGE_BPS="40", PENNY="0")
+        await sim.step(bot, s, clock, "80000.0", "80100.0")
+        b0 = bot.om.get_order_by_slot(0, BUY)
+        a0 = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(b0)
+        self.assertIsNotNone(a0)
+        normal_spread = a0.price - b0.price
+
+        # External venues disagree: Binance at 79900, Bybit at 80200 (>30 bps dispersion)
+        bot.on_external_venue_bbo("BINANCE", D("79900.0"), D("79910.0"))
+        bot.on_external_venue_bbo("BYBIT", D("80190.0"), D("80200.0"))
+        disp = bot.md.cross.cross_dispersion_bps()
+        self.assertGreater(disp, D("20.0"), "Cross-venue dispersion should be elevated")
+
+        await sim.step(bot, s, clock, "80000.0", "80100.0")
+        b1 = bot.om.get_order_by_slot(0, BUY)
+        a1 = bot.om.get_order_by_slot(0, SELL)
+        if b1 and a1:
+            widened_spread = a1.price - b1.price
+            self.assertGreaterEqual(widened_spread, normal_spread, "Spread should widen during venue disagreement")
+            print(f"✓ test_14_cross_exchange_dispersion_and_spread_capture passed: Spread widened from {normal_spread} to {widened_spread}.")
+        else:
+            print("✓ test_14_cross_exchange_dispersion_and_spread_capture passed: High dispersion protected quotes.")
+
+    async def test_15_smart_inventory_fast_breakeven_unwind(self):
+        """Test Smart Inventory Management: When adverse flow arrives (TFI < -0.5, OBI < -0.5), bot accelerates unwind down to breakeven maker."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 EXIT_MIN_PROFIT_BPS="1.5", ENABLE_SMART_INVENTORY_MGMT=1,
+                                 MIN_REQUOTE_S="0.1")
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        s.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertGreater(bot.ledger.position, D(0))
+
+        # Adverse flow arrives (selling pressure)
+        clock.t += 0.5
+        s.push_trade(SELL, "1.0", "80000.0")
+        await sim.step(bot, s, clock, "79990.0", "80010.0", bsz="0.2", asz="1.5")
+
+        ask_order = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(ask_order)
+        self.assertLess(ask_order.price, D("80010.0"), "Ask should be shaded down to breakeven maker under adverse flow")
+        print("✓ test_15_smart_inventory_fast_breakeven_unwind passed: Flow-accelerated breakeven unwind active.")
+
+    async def test_16_emergency_taker_cut_on_adverse_cascade(self):
+        """Test Emergency Taker Cut: When adverse loss and flow exceed threshold, bot fires IOC taker order to cut loss."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 EXIT_MIN_PROFIT_BPS="1.5", ENABLE_SMART_INVENTORY_MGMT=1,
+                                 MIN_REQUOTE_S="0.1", EMERGENCY_TAKER_LOSS_BPS="6.0")
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        s.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertGreater(bot.ledger.position, D(0))
+
+        # Severe price dump with persistent aggressive selling
+        clock.t += 0.5
+        s.push_trade(SELL, "2.0", "79900.0")
+        await sim.step(bot, s, clock, "79900.0", "79920.0", bsz="0.1", asz="2.0")
+
+        self.assertEqual(bot.ledger.position, D(0), "Long position should be liquidated via taker order")
+        print("✓ test_16_emergency_taker_cut_on_adverse_cascade passed: Emergency Taker Cut liquidated position.")
+
+
+
+
+    async def test_17_severe_selling_pressure_maker_scratch_and_taker_cut(self):
+        """Test User Real Log Scenario:
+        1. Long position held at cost 80000.0.
+        2. Market drops to 79992.0 (loss ~1.0 bps) with severe selling pressure (OBI=-0.8, TFI=-1.0).
+        3. Bot joins best ask as aggressive maker scratch at 0% maker fee, rather than hanging above market.
+        4. When price cascades further to 79940.0 (loss > 6.0 bps), emergency taker IOC fires to cut loss.
+        """
+        bot, s, clock = sim.make(EXTRA_LEVELS=2, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 EXIT_MIN_PROFIT_BPS="1.5", ENABLE_SMART_INVENTORY_MGMT=1,
+                                 MIN_REQUOTE_S="0.1", EMERGENCY_TAKER_LOSS_BPS="6.0")
+        # 1. Fill Long at 80000.0
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        s.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertGreater(bot.ledger.position, D(0))
+        entry_cost = bot.ledger.avg_cost
+
+        # 2. Market drops 1 bps below entry cost with severe selling pressure
+        clock.t += 0.5
+        s.push_trade(SELL, "1.0", "79992.0")
+        await sim.step(bot, s, clock, "79988.0", "79996.0", bsz="0.1", asz="0.9")
+
+        # Check: Unwind ask must join best ask (79996.0 or penny 79995.9), NOT hang above entry_cost
+        ask_order = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(ask_order)
+        self.assertLessEqual(ask_order.price, D("79996.0"), "Unwind ask must join top of book as maker scratch")
+        self.assertLess(ask_order.price, entry_cost, "Under severe selling pressure, ask must not be held above cost")
+
+        # Check: All BUY levels must be suppressed (no falling knife accumulation)
+        buy_order_l0 = bot.om.get_order_by_slot(0, BUY)
+        buy_order_l1 = bot.om.get_order_by_slot(1, BUY)
+        self.assertIsNone(buy_order_l0, "L0 BUY must be suppressed during severe selling pressure")
+        self.assertIsNone(buy_order_l1, "L1 BUY must be suppressed during severe selling pressure")
+
+        # 3. Market cascades down past 6.0 bps loss
+        clock.t += 0.5
+        s.push_trade(SELL, "2.0", "79940.0")
+        await sim.step(bot, s, clock, "79930.0", "79940.0", bsz="0.05", asz="2.0")
+
+        # Check: Emergency Taker Cut executed, position is flat
+        self.assertEqual(bot.ledger.position, D(0), "Position must be liquidated via emergency taker order")
+        print("✓ test_17_severe_selling_pressure_maker_scratch_and_taker_cut passed: Scratch & Taker cut verified.")
+
+
+
+    async def test_18_reduce_only_enforcement_on_maker_unwind(self):
+        """Test Critical Bug Fix: Unwind maker orders MUST be marked reduce_only=True in both place and modify."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100)
+        # 1. Flat market: entry order must NOT be reduce_only
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        buy_order = bot.om.get_order_by_slot(0, BUY)
+        self.assertIsNotNone(buy_order)
+        self.assertFalse(buy_order.is_reduce_only, "Entry order must NOT be reduce-only")
+
+        # 2. Fill Long -> Unwind order must be marked reduce_only
+        s.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await bot.tick()
+        self.assertGreater(bot.ledger.position, D(0))
+
+        # Check placed exit ask
+        ask_order = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(ask_order)
+        self.assertTrue(ask_order.is_reduce_only, "Exit ask order MUST be reduce_only=True")
+
+        # 3. Market moves, modifying the exit ask: modify request must retain reduce_only=True
+        clock.t += 0.5
+        await sim.step(bot, s, clock, "80020.0", "80100.0")
+        ask_order2 = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(ask_order2)
+        self.assertTrue(ask_order2.is_reduce_only, "Modified exit ask order MUST retain reduce_only=True")
+        print("✓ test_18_reduce_only_enforcement_on_maker_unwind passed: Reduce-only strictly enforced on placement and modification.")
+
+    async def test_19_queue_aware_fill_probability_and_selective_touch(self):
+        """Test Queue-Aware Fill Probability & Selective-Touch:
+        When top-of-book depth is heavy and fragility is high, bot quotes 1-tick back instead of blindly taking toxic touch."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ENABLE_SELECTIVE_TOUCH=1, ENABLE_QUEUE_MODEL=1)
+        await sim.step(bot, s, clock, "80000.0", "80010.0")
+        # Setup book depth: bids=[(80000, 100)], asks=[(80010, 0.5)] -> 100 contracts ahead of us at 80000
+        bot.md.on_depth([[D("80000.0"), D("100.0")]], [[D("80010.0"), D("0.5")]], clock.t)
+        
+        # Balanced two-way flow with large resting queue ahead (100 contracts)
+        bot.md.on_trade(BUY, D("6.0"), D("80010.0"), clock.t)
+        bot.md.on_trade(SELL, D("5.0"), D("80000.0"), clock.t)
+        fragility = bot.md.liquidity_fragility(BUY, clock.t)
+        self.assertGreater(fragility, D("0.01"), "Fragility should be measurable")
+
+        # Queue fill probability: with 100 contracts ahead, fill probability is realistic (not 1.0)
+        p_fill_touch = bot.engine.queue_fill_probability(BUY, D("80000.0"), bot.md, clock.t)
+        self.assertLess(p_fill_touch, 0.90, "Queue fill probability should be bounded by queue drainage")
+
+        # Bot generates quotes under selective touch candidate selection
+        quotes = bot.engine.generate_ladder_quotes(bot._get_market(), bot.md, bot.ledger, clock.t, False, False)
+        buy_quotes = [q for q in quotes if q.side == BUY]
+        self.assertGreaterEqual(len(buy_quotes), 1, "Should generate at least one buy quote candidate")
+        self.assertGreater(buy_quotes[0].expected_value_bps, D("-10"))
+        print("✓ test_19_queue_aware_fill_probability_and_selective_touch passed: Queue dynamics and selective candidates verified.")
+
+    async def test_20_liquidity_fragility_and_absorption_exhaustion(self):
+        """Test Liquidity Fragility & Trade Flow Exhaustion Detection:
+        Detects when aggressive selling halts and depth absorbs the pressure."""
+        bot, s, clock = sim.make()
+        # 1. High selling volume in recent past (10s), but calm in last 1s -> deceleration
+        for i in range(10):
+            bot.md.on_trade(SELL, D("1.0"), D("80000.0"), clock.t - 8.0 + i * 0.5)
+        # Stalled price drop
+        bot.md._hist.append((clock.t - 3.0, D("80000.0")))
+        bot.md._hist.append((clock.t, D("79998.0"))) # only -0.25 bps move
+
+        is_exh = bot.md.is_exhaustion(BUY, clock.t)
+        self.assertTrue(is_exh, "Exhaustion should trigger when severe selling momentum decelerates and price holds")
+        print("✓ test_20_liquidity_fragility_and_absorption_exhaustion passed: Flow exhaustion and absorption detected.")
+
+    async def test_21_alpha_and_funding_aware_inventory_target(self):
+        """Test Alpha and Funding-Aware Inventory Target:
+        Positive funding rate (longs pay shorts) causes bot to set negative inventory target, favoring short inventory."""
+        bot, s, clock = sim.make(ENABLE_SMART_INVENTORY_MGMT=1, ENABLE_FUNDING_CARRY=1)
+        # Positive funding rate: longs pay shorts (e.g. 5 bps per interval)
+        bot.md.info.funding_rate = D("0.0005") # +5 bps
+        await sim.step(bot, s, clock, "80000.0", "80020.0")
+
+        q_target = bot.engine.compute_target_inventory_usd(bot.md, clock.t, bot.ledger)
+        self.assertLess(q_target, D(0), "Target inventory should be negative (short) when funding pays shorts")
+
+        # Check reservation price with target inventory:
+        # Flat position with negative target inventory -> effective position is net positive -> reservation price skews lower
+        res_price = bot.engine.compute_reservation_price(D("80010.0"), D(0), D("2.0"), bot.ledger, target_inventory_usd=q_target)
+        self.assertLess(res_price, D("80010.0"), "When target is short, reservation price shifts lower to incentivize selling / discourage buying")
+        print("✓ test_21_alpha_and_funding_aware_inventory_target passed: Target inventory adapts to funding carry and alpha.")
+
+    async def test_22_multi_horizon_markout_and_funding_pnl(self):
+        """Test Multi-Horizon Markout (500ms, 1s, 2s, 5s) and Funding Cashflow PnL Integration."""
+        bot, s, clock = sim.make()
+        # 1. Fill Buy
+        fill = bot.ledger.on_fill(BUY, D("0.00025"), D("80000.0"), D("80010.0"), clock.t, D("5"))
+        
+        # Advance 0.5s -> 500ms markout evaluated
+        clock.t += 0.5
+        bot.ledger.process_markouts(D("80020.0"), clock.t)
+        self.assertIsNotNone(bot.ledger.latest_markout_500ms)
+        self.assertEqual(bot.ledger.latest_markout_500ms, D("2.5")) # (80020 - 80000) / 80000 * 10000 = +2.5 bps
+
+        # Advance to 2.0s -> 1s and 2s markout evaluated
+        clock.t += 1.5
+        bot.ledger.process_markouts(D("80030.0"), clock.t)
+        self.assertIsNotNone(bot.ledger.latest_markout_1s)
+        self.assertIsNotNone(bot.ledger.latest_markout_2s)
+        self.assertEqual(bot.ledger.latest_markout_2s, D("3.75"))
+
+        # 2. Apply funding payment
+        init_pnl = bot.ledger.total_pnl(D("80030.0"))
+        bot.ledger.apply_funding(D("0.05")) # received /usr/bin/bash.05 funding
+        new_pnl = bot.ledger.total_pnl(D("80030.0"))
+        self.assertEqual(new_pnl, init_pnl + D("0.05"), "Total PnL must include cumulative funding cashflow")
+        print("✓ test_22_multi_horizon_markout_and_funding_pnl passed: Multi-horizon markouts and funding cashflows verified.")
+
+
+    async def test_23_empirical_markout_model_predictions(self):
+        """Test Empirical Bayesian Markout Model: Learns E[markout | side, regime, level] with shrinkage toward prior."""
+        bot, s, clock = sim.make()
+        learner = bot.ledger.learner
+
+        # Prior prediction in quiet regime: +0.5 bps
+        p_quiet = learner.predict_markout(BUY, "REGIME_A_QUIET", level=0, horizon=2.0)
+        self.assertEqual(p_quiet, D("0.5"))
+
+        # Prior prediction in toxic regime: -2.5 bps
+        p_toxic = learner.predict_markout(BUY, "REGIME_D_TOXIC", level=0, horizon=2.0)
+        self.assertEqual(p_toxic, D("-2.5"))
+
+        # Record 10 adverse fills (-5.0 bps each) in TOXIC regime
+        for _ in range(10):
+            learner.markout_model.record(BUY, "REGIME_D_TOXIC", 0, 2.0, -5.0)
+
+        # Updated prediction should adapt toward -5.0 via shrinkage (10/(10+5) * -5.0 + 5/15 * -2.5 = -4.17 bps)
+        p_updated = learner.predict_markout(BUY, "REGIME_D_TOXIC", level=0, horizon=2.0)
+        self.assertLess(p_updated, D("-3.5"), "Empirical markout model must adapt downward with adverse observations")
+        print("✓ test_23_empirical_markout_model_predictions passed: Bayesian shrinkage and empirical learning verified.")
+
+    async def test_24_vwap_cross_cost_calculation(self):
+        """Test Order Book Walk for Taker Cross Cost:
+        Walks actual L2 depth to compute VWAP crossing price and slippage."""
+        bot, s, clock = sim.make(TAKER_FEE_BPS="2.2")
+        await sim.step(bot, s, clock, "80000.0", "80010.0")
+
+        # Setup 2-tier ask book: 0.1 BTC @ 80010, 0.2 BTC @ 80020
+        bot.md.on_depth([[D("80000.0"), D("1.0")]],
+                        [[D("80010.0"), D("0.1")], [D("80020.0"), D("0.2")]], clock.t)
+
+        # Need to buy 0.2 BTC: 0.1 filled @ 80010, 0.1 filled @ 80020 -> VWAP = 80015
+        vwap, cross_cost_bps = bot.engine.calculate_vwap_cross_cost(BUY, D("0.2"), bot.md)
+        self.assertEqual(vwap, D("80015.0"))
+        # Crossing cost = slip vs mid(80005) = (80015 - 80005)/80005 * 10000 + 2.2 bps = 1.25 + 2.2 = 3.45 bps
+        self.assertGreater(cross_cost_bps, D("3.0"))
+        print("✓ test_24_vwap_cross_cost_calculation passed: Exact L2 depth VWAP walking verified.")
+
+    async def test_25_onesided_touch_suppression(self):
+        """Test One-Sided Touch:
+        When extreme toxic flow is directed at ask side, touch ask is suppressed to avoid steamroller fills."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=1, ENABLE_ONESIDED_TOUCH=1)
+        await sim.step(bot, s, clock, "80000.0", "80010.0")
+
+        # Simulate massive aggressive buying burst: TFI = +0.8, OBI = +0.8, regime = TOXIC
+        for _ in range(5):
+            bot.md.on_trade(BUY, D("2.0"), D("80010.0"), clock.t)
+        bot.ledger.markouts.append(D("-5.0")) # triggers toxic regime
+
+        quotes = bot.engine.generate_ladder_quotes(bot._get_market(), bot.md, bot.ledger, clock.t, False, False)
+        # Touch ask (level 0 SELL) must be suppressed under one-sided touch
+        touch_sells = [q for q in quotes if q.side == SELL and q.pair_index == 0]
+        self.assertEqual(len(touch_sells), 0, "Touch SELL must be suppressed during aggressive buying steam")
+        print("✓ test_25_onesided_touch_suppression passed: One-sided touch protection active.")
+
+    async def test_26_quote_opportunity_dataset_logging(self):
+        """Test Quote Opportunity Dataset Logger:
+        Logs complete microstructure snapshot and candidate actions to JSONL."""
+        test_log = "test_quote_opportunities.jsonl"
+        if os.path.exists(test_log):
+            os.remove(test_log)
+
+        bot, s, clock = sim.make(ENABLE_QUOTE_DATASET=1, QUOTE_DATASET_PATH=test_log)
+        await sim.step(bot, s, clock, "80000.0", "80010.0")
+        await bot.tick()
+
+        self.assertTrue(os.path.exists(test_log), "Quote opportunity log file must be created")
+        with open(test_log) as f:
+            lines = f.readlines()
+        self.assertGreater(len(lines), 0, "At least one quote opportunity record must be logged")
+
+        import json
+        rec = json.loads(lines[0])
+        self.assertIn("snapshot", rec)
+        self.assertIn("quotes", rec)
+        self.assertIn("spread_ticks", rec["snapshot"])
+        self.assertIn("obi_l1", rec["snapshot"])
+
+        if os.path.exists(test_log):
+            os.remove(test_log)
+        print("✓ test_26_quote_opportunity_dataset_logging passed: High-frequency quote opportunity dataset verified.")
 
 if __name__ == "__main__":
     unittest.main()

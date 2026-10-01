@@ -31,6 +31,9 @@ class Order:
     last_action: float
     filled_any: bool = False
     cancelling_since: Optional[float] = None
+    is_taker: bool = False
+    is_reduce_only: bool = False
+    ev_bps: Decimal = Decimal(0)
 
 
 class OrderManager:
@@ -103,11 +106,13 @@ class OrderManager:
         self._reject_n[side] += 1
         self.reject_until[side] = now + min(0.25 * 2 ** (self._reject_n[side] - 1), 4.0)
 
-    async def place(self, pair_index: int, side: str, px: Decimal, qty: Decimal, now: float) -> Optional[Order]:
+    async def place(self, pair_index: int, side: str, px: Decimal, qty: Decimal, now: float,
+                    time_in_force: str = "ALO", reduce_only: bool = False) -> Optional[Order]:
         if now < self.paused_until or not self._budget(now):
             return None
         good_til = int(time.time() * 1_000_000) + GTT_DAYS * 86_400 * 1_000_000
-        req = self.signer.place(self.get_market(), side, px, qty, good_til)
+        req = self.signer.place(self.get_market(), side, px, qty, good_til,
+                                time_in_force=time_in_force, reduce_only=reduce_only)
         self.maybe_orders = True
         self.last_place_ts = now
         resp = await self.ex.write(req)
@@ -120,7 +125,8 @@ class OrderManager:
         self._consec_errors = 0
         self.n_place += 1
         oid = str(res["orderId"])
-        o = Order(oid, pair_index, side, px, qty, qty, good_til, now, now)
+        o = Order(oid, pair_index, side, px, qty, qty, good_til, now, now,
+                  is_taker=(time_in_force == "IOC"), is_reduce_only=reduce_only)
         self.orders[oid] = o
         self.pair_slots[(pair_index, side)] = oid
         log.info("PLACE L%d %s %s @ %s", pair_index, side, fmt(qty), fmt(px))
@@ -129,12 +135,14 @@ class OrderManager:
             self._apply(o, early[1], now)
         return o
 
-    async def modify(self, o: Order, px: Decimal, now: float, urgent: bool = False) -> bool:
+    async def modify(self, o: Order, px: Decimal, now: float, urgent: bool = False,
+                     reduce_only: Optional[bool] = None) -> bool:
         if now < self.paused_until or not self._budget(now):
             if urgent:
                 await self.cancel(o, now)
             return False
-        req = self.signer.modify(self.get_market(), o.order_id, o.side, px, o.qty, o.good_til_us)
+        r_only = o.is_reduce_only if reduce_only is None else reduce_only
+        req = self.signer.modify(self.get_market(), o.order_id, o.side, px, o.qty, o.good_til_us, reduce_only=r_only)
         resp = await self.ex.write(req)
         if not self._ok(resp):
             self._error(f"modify L{o.pair_index} {o.side}", resp, now)
@@ -142,8 +150,8 @@ class OrderManager:
             return False
         self._consec_errors = 0
         self.n_modify += 1
-        log.info("MODIFY L%d %s %s -> %s", o.pair_index, o.side, fmt(o.price), fmt(px))
-        o.price, o.last_action = px, now
+        log.info("MODIFY L%d %s %s -> %s (reduce_only=%s)", o.pair_index, o.side, fmt(o.price), fmt(px), r_only)
+        o.price, o.last_action, o.is_reduce_only = px, now, r_only
         return True
 
     async def cancel(self, o: Order, now: float) -> None:
@@ -195,24 +203,44 @@ class OrderManager:
             active_slots.add(slot)
             existing = self.get_order_by_slot(t.pair_index, t.side)
             
+            if getattr(t, "is_taker", False):
+                if existing:
+                    await self.cancel(existing, now)
+                await self.place(t.pair_index, t.side, t.price, t.qty, now,
+                                 time_in_force="IOC", reduce_only=True)
+                continue
+
+            is_exit = bool(getattr(t, "is_exit_quote", False))
             if existing is None:
                 if now >= self.reject_until[t.side]:
-                    await self.place(t.pair_index, t.side, t.price, t.qty, now)
+                    o_new = await self.place(t.pair_index, t.side, t.price, t.qty, now,
+                                             time_in_force="ALO", reduce_only=is_exit)
+                    if o_new:
+                        o_new.ev_bps = getattr(t, "expected_value_bps", Decimal(0))
             else:
                 drift = abs(bps_diff(t.price, existing.price))
                 is_advancing = (t.side == BUY and t.price > existing.price) or (t.side == SELL and t.price < existing.price)
                 is_retreating = not is_advancing
-                
+
                 should_modify = False
                 urgent = False
+
+                if getattr(existing, "is_reduce_only", False) != is_exit:
+                    should_modify = True
+                    urgent = True
+
                 if is_retreating and drift >= self.cfg.retreat_bps:
                     should_modify = True
                     urgent = True
-                elif is_advancing and drift >= self.cfg.requote_bps and (now - existing.last_action >= self.cfg.min_requote_s):
-                    should_modify = True
+                elif is_advancing and drift >= self.cfg.requote_bps and (now - existing.last_action >= (getattr(self.cfg, "touch_min_requote_s", self.cfg.min_requote_s) if existing.pair_index == 0 else self.cfg.min_requote_s)):
+                    queue_reset_cost = getattr(self.cfg, "queue_reset_cost_bps", Decimal("0.20"))
+                    ev_gain = getattr(t, "expected_value_bps", Decimal(0)) - getattr(existing, "ev_bps", Decimal(0))
+                    if ev_gain >= queue_reset_cost or drift >= (self.cfg.requote_bps * Decimal("1.5")):
+                        should_modify = True
 
                 if should_modify:
-                    await self.modify(existing, t.price, now, urgent=urgent)
+                    if await self.modify(existing, t.price, now, urgent=urgent, reduce_only=is_exit):
+                        existing.ev_bps = getattr(t, "expected_value_bps", Decimal(0))
 
         for slot, oid in list(self.pair_slots.items()):
             if slot not in active_slots:
