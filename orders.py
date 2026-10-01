@@ -188,9 +188,26 @@ class OrderManager:
         if not force and not self.orders and not self.maybe_orders:
             return
         m = self.get_market()
-        body = {"address": self.cfg.address, "accountIndex": self.cfg.account_index, "marketId": m.market_id}
-        resp = await self.ex.write(self.signer.legacy("cancelAllOrders", body))
-        log.info("CANCEL-ALL sent (status %s)", resp.get("status"))
+        now = time.time()
+        for o in list(self.orders.values()):
+            await self.cancel(o, now)
+
+        if (force or self.maybe_orders) and not self.cfg.dry_run and getattr(self.ex, "is_connected", False):
+            try:
+                res = await self.ex.get("orders", {"address": self.cfg.address, "accountIndex": self.cfg.account_index,
+                                                    "marketId": m.market_id})
+                if res and "openOrders" in res:
+                    for r in res["openOrders"]:
+                        if isinstance(r, dict):
+                            r_mkt = r.get("marketId")
+                            if r_mkt is not None and int(r_mkt) != m.market_id:
+                                continue
+                            oid = str(r.get("orderId") or r.get("id"))
+                            if oid and oid != "None" and oid not in self.orders:
+                                await self.ex.write(self.signer.cancel(m, oid))
+            except Exception:
+                pass
+
         self.orders.clear()
         self.pair_slots.clear()
         self.maybe_orders = False
@@ -251,6 +268,13 @@ class OrderManager:
     def on_update(self, c, now: float) -> None:
         if not isinstance(c, dict) or not c.get("orderId"):
             return
+        mkt_id = c.get("marketId")
+        if mkt_id is not None:
+            try:
+                if int(mkt_id) != self.get_market().market_id:
+                    return
+            except Exception:
+                pass
         oid = str(c["orderId"])
         o = self.orders.get(oid)
         if o is None:
@@ -300,7 +324,21 @@ class OrderManager:
             self._remove_order(o.order_id)
 
     async def reconcile(self, rows: list, now: float) -> None:
-        open_ids = {str(r.get("orderId") or r.get("id")) for r in rows}
+        m = self.get_market()
+        market_rows = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            r_mkt = r.get("marketId")
+            if r_mkt is not None:
+                try:
+                    if int(r_mkt) != m.market_id:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            market_rows.append(r)
+
+        open_ids = {str(r.get("orderId") or r.get("id")) for r in market_rows}
         for o in list(self.orders.values()):
             if o.order_id not in open_ids and now - o.last_action > 5 and o.cancelling_since is None:
                 log.warning("dropping ghost L%d %s order %s", o.pair_index, o.side, o.order_id)
@@ -312,5 +350,5 @@ class OrderManager:
         for oid in (open_ids - mine - recent_closed):
             if oid and oid != "None":
                 self._recently_closed.append((now, oid))
-                log.warning("cancelling orphan order %s", oid)
-                await self.ex.write(self.signer.cancel(self.get_market(), oid))
+                log.warning("cancelling orphan order %s for market %s (id %d)", oid, m.name, m.market_id)
+                await self.ex.write(self.signer.cancel(m, oid))

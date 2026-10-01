@@ -420,43 +420,81 @@ class MarketMaker:
 
         try:
             import websockets
+            from websockets.exceptions import ConnectionClosed
         except ImportError:
-            log.error("websockets package not available; install via pip install websockets")
-            return
+            class ConnectionClosed(Exception):
+                pass
+            if not hasattr(self.ex, "ws") or self.ex.ws is None:
+                log.error("websockets package not available; install via pip install websockets")
+                return
 
-        async with websockets.connect(self.ex.ws_url, ping_interval=15, max_size=2**23) as ws:
-            self.ex.ws = ws
-            reader_task = asyncio.create_task(self.ex.reader())
+        reconnect_delay = 1.0
+        max_reconnect_delay = 15.0
 
-            await self.ex.subscribe("bbo", self.cfg.market)
-            await self.ex.subscribe("l2Orderbook", self.cfg.market)
-            await self.ex.subscribe("trades", self.cfg.market)
-            await self.ex.subscribe("orders", self.cfg.address)
-            await self.ex.subscribe("userFills", self.cfg.address)
-            await self.ex.subscribe("positions", self.cfg.address)
+        while not self.stop_evt.is_set():
+            reader_task = None
+            try:
+                log.info("Connecting to Arcus WebSocket (%s)...", self.ex.ws_url)
+                async with websockets.connect(
+                    self.ex.ws_url,
+                    ping_interval=15,
+                    ping_timeout=20,
+                    max_size=2**23,
+                    close_timeout=5
+                ) as ws:
+                    self.ex.ws = ws
+                    reader_task = asyncio.create_task(self.ex.reader())
 
-            if self.om.maybe_orders:
-                await self.om.cancel_all()
+                    await self.ex.subscribe("bbo", self.cfg.market)
+                    await self.ex.subscribe("l2Orderbook", self.cfg.market)
+                    await self.ex.subscribe("trades", self.cfg.market)
+                    await self.ex.subscribe("orders", self.cfg.address)
+                    await self.ex.subscribe("userFills", self.cfg.address)
+                    await self.ex.subscribe("positions", self.cfg.address)
 
-            log.info("Subscribed to data feeds. Level 7 MM Engine active.")
+                    reconnect_delay = 1.0
 
-            while not self.stop_evt.is_set():
-                now = self.now()
-                await self._heartbeat(now)
-                await self._reconcile(now)
-                self._status_log(now)
+                    if self.om.maybe_orders:
+                        await self.om.cancel_all()
 
-                await self.tick()
+                    log.info("Subscribed to data feeds. Level 7 MM Engine active.")
 
-                try:
-                    await asyncio.wait_for(self._dirty_evt.wait(), timeout=self.cfg.loop_s)
-                    self._dirty_evt.clear()
-                except asyncio.TimeoutError:
-                    pass
+                    while not self.stop_evt.is_set() and self.ex.is_connected:
+                        now = self.now()
+                        await self._heartbeat(now)
+                        await self._reconcile(now)
+                        self._status_log(now)
 
-            log.info("Stopping bot - cancelling all resting orders...")
-            if self.cfg.enable_online_learning:
-                self.ledger.learner.save()
-                log.info("Saved online learning state to %s", self.cfg.learning_state_path)
+                        await self.tick()
+
+                        try:
+                            await asyncio.wait_for(self._dirty_evt.wait(), timeout=self.cfg.loop_s)
+                            self._dirty_evt.clear()
+                        except asyncio.TimeoutError:
+                            pass
+
+            except (ConnectionClosed, ConnectionResetError, BrokenPipeError, OSError) as e:
+                log.warning("WebSocket connection dropped (%s). Reconnecting in %.1fs...", e, reconnect_delay)
+            except Exception as e:
+                log.error("Error in bot run loop: %s", e, exc_info=True)
+            finally:
+                if reader_task and not reader_task.done():
+                    reader_task.cancel()
+                    try:
+                        await reader_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                self.ex.ws = None
+
+            if not self.stop_evt.is_set():
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
+
+        log.info("Stopping bot - cancelling resting orders for market %s...", self.md.info.name if self.md.info else self.cfg.market)
+        if self.cfg.enable_online_learning:
+            self.ledger.learner.save()
+            log.info("Saved online learning state to %s", self.cfg.learning_state_path)
+        try:
             await self.om.cancel_all()
-            reader_task.cancel()
+        except Exception:
+            pass
