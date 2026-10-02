@@ -27,6 +27,8 @@ class QuoteTarget:
 class MarketMakingEngine:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self._chase_top_until: float = 0.0
+        self._chase_bottom_until: float = 0.0
 
     def compute_fair_value(self, md: MarketData, now: float, ledger: Optional[Ledger] = None) -> Decimal:
         base_mid = md.mid
@@ -286,8 +288,17 @@ class MarketMakingEngine:
         ))
         ret_5s = md.ret_bps(self.cfg.trend_window_s, now)
         trend_pull = l.trend_pull_bps if l else self.cfg.trend_pull_bps
-        chasing_top = (ret_5s > Decimal("0.8") and (is_toxic or flow_bias > Decimal("0.3")))
-        chasing_bottom = (ret_5s < Decimal("-0.8") and (is_toxic or flow_bias < Decimal("-0.3")))
+        chase_cooldown = getattr(self.cfg, "chase_cooldown_s", 3.0)
+
+        chase_top_trigger = (ret_5s > Decimal("0.8") and (is_toxic or flow_bias > Decimal("0.30")))
+        if chase_top_trigger:
+            self._chase_top_until = now + chase_cooldown
+        chasing_top = (now < getattr(self, "_chase_top_until", 0.0) or (ret_5s > Decimal("0.6") and flow_bias > Decimal("0.20")))
+
+        chase_bottom_trigger = (ret_5s < Decimal("-0.8") and (is_toxic or flow_bias < Decimal("-0.30")))
+        if chase_bottom_trigger:
+            self._chase_bottom_until = now + chase_cooldown
+        chasing_bottom = (now < getattr(self, "_chase_bottom_until", 0.0) or (ret_5s < Decimal("-0.6") and flow_bias < Decimal("-0.20")))
 
                 # Adverse flow detection for long (facing selling pressure) and short (facing buying pressure)
         has_adverse_selling = (tfi <= Decimal("-0.5") or (tfi <= Decimal("-0.2") and obi <= Decimal("-0.5")) or (obi <= Decimal("-0.7")) or (flow_bias <= Decimal("-0.4")))

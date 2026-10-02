@@ -12,7 +12,7 @@ from typing import Callable, Optional, Dict, Tuple, List
 from exchange import Exchange
 from market import Market
 from signer import Signer
-from utils import BUY, SELL, fmt, bps_diff
+from utils import BUY, SELL, fmt, bps_diff, q_down, q_up
 
 log = logging.getLogger("orders")
 GTT_DAYS = 40
@@ -110,8 +110,14 @@ class OrderManager:
                     time_in_force: str = "ALO", reduce_only: bool = False) -> Optional[Order]:
         if now < self.paused_until or not self._budget(now):
             return None
+        m = self.get_market()
+        tick = m.tick_for(px) if hasattr(m, "tick_for") else m.tick
+        px = q_down(px, tick) if side == BUY else q_up(px, tick)
+        qty = q_down(qty, m.step)
+        if qty < m.min_size or (m.min_notional > 0 and px * qty < m.min_notional):
+            return None
         good_til = int(time.time() * 1_000_000) + GTT_DAYS * 86_400 * 1_000_000
-        req = self.signer.place(self.get_market(), side, px, qty, good_til,
+        req = self.signer.place(m, side, px, qty, good_til,
                                 time_in_force=time_in_force, reduce_only=reduce_only)
         self.maybe_orders = True
         self.last_place_ts = now
@@ -141,8 +147,11 @@ class OrderManager:
             if urgent:
                 await self.cancel(o, now)
             return False
+        m = self.get_market()
+        tick = m.tick_for(px) if hasattr(m, "tick_for") else m.tick
+        px = q_down(px, tick) if o.side == BUY else q_up(px, tick)
         r_only = o.is_reduce_only if reduce_only is None else reduce_only
-        req = self.signer.modify(self.get_market(), o.order_id, o.side, px, o.qty, o.good_til_us, reduce_only=r_only)
+        req = self.signer.modify(m, o.order_id, o.side, px, o.qty, o.good_til_us, reduce_only=r_only)
         resp = await self.ex.write(req)
         if not self._ok(resp):
             self._error(f"modify L{o.pair_index} {o.side}", resp, now)
