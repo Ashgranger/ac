@@ -385,6 +385,133 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         self.assertLess(ask_order.price, D("80010.0"), "Ask should be shaded down to breakeven maker under adverse flow")
         print("✓ test_15_smart_inventory_fast_breakeven_unwind passed: Flow-accelerated breakeven unwind active.")
 
+    async def test_17_taker_fill_booked_at_book_price_not_far_limit(self):
+        """Regression: IOC taker exits were booked at their far-through limit (-15..-18bps phantom loss)."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 EXIT_MIN_PROFIT_BPS="1.5", ENABLE_SMART_INVENTORY_MGMT=1,
+                                 MIN_REQUOTE_S="0.1", EMERGENCY_TAKER_LOSS_BPS="6.0")
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        s.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        clock.t += 0.5
+        s.push_trade(SELL, "2.0", "79900.0")
+        await sim.step(bot, s, clock, "79900.0", "79920.0", bsz="0.1", asz="2.0")
+        f = bot.ledger.fills[-1]
+        self.assertEqual(bot.ledger.position, D(0))
+        self.assertGreaterEqual(f.price, D("79899.0"), "taker must be booked near the touch (bid 79900), not at its limit")
+        self.assertGreater(f.edge_bps, D("-3"))
+
+    async def test_18_adverse_obi_persist_exit(self):
+        """Book leaning against an open long for a few seconds + small loss -> early taker exit, only when enabled."""
+        async def run(enabled):
+            bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                     EXIT_MIN_PROFIT_BPS="1.5", ENABLE_SMART_INVENTORY_MGMT=1,
+                                     MIN_REQUOTE_S="0.1", STRESS_LOSS_BPS="50", EMERGENCY_TAKER_LOSS_BPS="50",
+                                     ADV_OBI_EXIT=enabled, ADV_OBI_SECS="3", ADV_OBI_LOSS_BPS="2.0")
+            await sim.step(bot, s, clock, "80000.0", "80080.0")
+            s.taker(SELL)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            for _ in range(8):
+                await sim.step(bot, s, clock, "79970.0", "79990.0", bsz="0.1", asz="5.0", dt=1.0)
+            return bot.ledger.position
+        self.assertEqual(await run("1"), D(0), "persistent adverse book + loss must flatten via taker")
+        self.assertNotEqual(await run("0"), D(0), "rule is off by default")
+
+    async def test_19_daily_loss_pause_keeps_running_and_unwinds(self):
+        """SESSION_LOSS_ACTION=pause_day: breach must NOT stop the bot, only block new adds."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 SESSION_MAX_LOSS_USD="0.001", SESSION_LOSS_ACTION="pause_day",
+                                 ENABLE_SMART_INVENTORY_MGMT=1, MIN_REQUOTE_S="0.1")
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        s.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        for _ in range(6):
+            await sim.step(bot, s, clock, "79900.0", "79920.0", bsz="0.1", asz="2.0", dt=1.0)
+        self.assertFalse(bot.stop_evt.is_set(), "pause_day must not halt the process")
+        self.assertGreater(bot._loss_pause_until, 0.0)
+        # default behavior unchanged
+        bot2, s2, clock2 = sim.make(SESSION_MAX_LOSS_USD="0.001", ORDER_USD=20, MAX_POSITION_USD=100)
+        await sim.step(bot2, s2, clock2, "80000.0", "80080.0")
+        s2.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        for _ in range(6):
+            await sim.step(bot2, s2, clock2, "79900.0", "79920.0", bsz="0.1", asz="2.0", dt=1.0)
+        self.assertTrue(bot2.stop_evt.is_set(), "default 'halt' still stops")
+
+    async def test_20_exclude_own_orders_from_book_metrics(self):
+        from market import MarketData
+        def mk(flag):
+            bot, s, clock = sim.make(EXCLUDE_OWN_ORDERS=flag)
+            md = MarketData(bot.cfg)
+            md.update(D("100.00"), D("100.02"), D("3"), D("1"), 1.0)
+            md.on_depth([["100.00", "3"], ["99.98", "5"]], [["100.02", "1"], ["100.04", "2"]], 1.0)
+            md.own_provider = lambda: [(BUY, D("100.00"), D("2"))]
+            return md
+        off, on = mk("0"), mk("1")
+        self.assertEqual(off.obi, D("0.5"))                  # (3-1)/(3+1): unchanged when switch is off
+        self.assertEqual(on.obi, D("0"))                     # (1-1)/(1+1): our 2 removed
+        self.assertEqual(on.top_size("BUY"), D("1"))
+        self.assertEqual(on.raw_obi, D("0.5"))
+        self.assertLess(on.micro, off.micro)                 # no longer pulled up by our own bid
+        self.assertEqual(on.queue_ahead(BUY, D("100.00")), D("1"))
+        self.assertEqual(off.queue_ahead(BUY, D("100.00")), D("3"))
+        # our order alone at the touch -> next external level used, never negative / zero-division
+        on.own_provider = lambda: [(BUY, D("100.00"), D("3"))]
+        self.assertEqual(on.top_size("BUY"), D("5"))
+        self.assertGreaterEqual(on.multi_depth_obi(5), D("-1"))
+        # unwinding/just-placed orders are not counted: provider is the filter (see bot._own_resting)
+        on.own_provider = lambda: []
+        self.assertEqual(on.obi, D("0.5"))
+
+    async def test_21_own_resting_filters_young_and_cancelling_and_taker(self):
+        bot, s, clock = sim.make(EXCLUDE_OWN_ORDERS="1", OWN_ORDER_MIN_AGE_S="0.3")
+        from orders import Order
+        now = bot.now()
+        mkd = lambda oid, created, **kw: Order(order_id=oid, pair_index=0, side=BUY, price=D("100"), qty=D("1"),
+                                               remaining=D("1"), good_til_us=0, created=created, last_action=created, **kw)
+        bot.om.orders.clear()
+        bot.om.orders["a"] = mkd("a", now - 5)
+        bot.om.orders["young"] = mkd("young", now - 0.05)
+        bot.om.orders["cx"] = mkd("cx", now - 5, cancelling_since=now - 1)
+        bot.om.orders["tk"] = mkd("tk", now - 5, is_taker=True)
+        self.assertEqual(len(bot._own_resting()), 1)
+
+    async def test_22_dynamic_sizing_multiplier(self):
+        bot, s, clock = sim.make(ENABLE_DYNAMIC_SIZING="1", MAX_POSITION_USD="1000", SESSION_MAX_LOSS_USD="3",
+                                 DYN_SIZE_MIN="0.25", DYN_INV_CAP_FRAC="0.6", DYN_INV_MIN="0.25")
+        await sim.step(bot, s, clock, "100.00", "100.02")
+        eng, md, led = bot.engine, bot.md, bot.ledger
+        now = clock.t
+        for _ in range(6):
+            led.markouts_buy.append((now, D("0.5")))
+            led.markouts_sell.append((now, D("-0.5")))
+        flat = eng.dynamic_size_mult(BUY, D("0"), md, led, "REGIME_A_QUIET", now)
+        self.assertEqual(flat, D("1"), "positive edge + flat inventory -> full size")
+        self.assertEqual(eng.dynamic_size_mult(SELL, D("0"), md, led, "REGIME_A_QUIET", now), D("0.25"),
+                         "non-positive realized edge -> floor size")
+        half = eng.dynamic_size_mult(BUY, D("300"), md, led, "REGIME_A_QUIET", now)   # f=0.3 of cap 0.6 -> halfway
+        self.assertTrue(D("0.55") < half < D("0.7"), half)
+        self.assertEqual(eng.dynamic_size_mult(BUY, D("-300"), md, led, "REGIME_A_QUIET", now), D("1"),
+                         "the side that REDUCES inventory is not shrunk by the inventory schedule")
+        self.assertEqual(eng.dynamic_size_mult(BUY, D("900"), md, led, "REGIME_A_QUIET", now), D("0.25"))
+        bot_off, s2, c2 = sim.make(ENABLE_DYNAMIC_SIZING="0")
+        self.assertEqual(bot_off.engine.dynamic_size_mult(SELL, D("900"), bot_off.md, bot_off.ledger, "REGIME_D_TOXIC", 0.0), D("1"))
+
+    async def test_23_et_window_wraps_midnight(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import bot as botmod
+        et = ZoneInfo("America/New_York")
+        at = lambda h, m: datetime(2026, 10, 5, h, m, tzinfo=et).timestamp()
+        self.assertTrue(botmod.in_et_windows("18:00-09:30", at(20, 15)))
+        self.assertTrue(botmod.in_et_windows("18:00-09:30", at(3, 0)))
+        self.assertFalse(botmod.in_et_windows("18:00-09:30", at(12, 0)))
+        self.assertTrue(botmod.in_et_windows("09:30-09:45,18:00-09:30", at(9, 35)))
+
     async def test_16_emergency_taker_cut_on_adverse_cascade(self):
         """Test Emergency Taker Cut: When adverse loss and flow exceed threshold, bot fires IOC taker order to cut loss."""
         bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
@@ -649,5 +776,451 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
             os.remove(test_log)
         print("✓ test_26_quote_opportunity_dataset_logging passed: High-frequency quote opportunity dataset verified.")
 
+    async def test_27_positive_spread_capture_and_no_mid_crossing(self):
+        """Verify that ladder quotes never cross mid, maintain monotonic depth, and capture strictly positive spread."""
+        bot, s, clock = sim.make(
+            MARKET="PUMP-USD",
+            MIN_EDGE_BPS="3.5",
+            MAX_EDGE_BPS="20.0",
+            EXTRA_LEVELS=2,
+            LEVEL_SPACING_BPS="3.0",
+            ENABLE_SELECTIVE_TOUCH=1,
+            ORDER_USD=50,
+            MAX_POSITION_USD=180
+        )
+        m_pump = sim.Market(10, "PUMP-USD", "ONLINE", D("0.000001"), D("1"), [], D("5"), D("1"), D("1000000"), D("0.005025"), False)
+        bot.md.info = m_pump
+        bot.md.info_ts = clock.t
+        bot.md.update(D("0.005000"), D("0.005050"), D("100000"), D("100000"), clock.t)
+
+        quotes = bot.engine.generate_ladder_quotes(m_pump, bot.md, bot.ledger, clock.t, False, False)
+        mid = bot.md.mid
+
+        buy_quotes = [q for q in quotes if q.side == BUY]
+        sell_quotes = [q for q in quotes if q.side == SELL]
+
+        self.assertGreaterEqual(len(buy_quotes), 1)
+        self.assertGreaterEqual(len(sell_quotes), 1)
+
+        # 1. Verify every BUY quote is strictly below mid, and every SELL quote is strictly above mid
+        for q in buy_quotes:
+            self.assertLess(q.price, mid, f"BUY quote {q.price} must be strictly less than mid {mid}")
+        for q in sell_quotes:
+            self.assertGreater(q.price, mid, f"SELL quote {q.price} must be strictly greater than mid {mid}")
+
+        # 2. Verify ladder depth monotonicity
+        for i in range(len(buy_quotes) - 1):
+            self.assertLess(buy_quotes[i+1].price, buy_quotes[i].price, "BUY ladder must descend into the book")
+        for i in range(len(sell_quotes) - 1):
+            self.assertGreater(sell_quotes[i+1].price, sell_quotes[i].price, "SELL ladder must ascend into the book")
+
+        # 3. Simulate a fill at L0 BUY and verify positive spread capture
+        l0_buy = buy_quotes[0]
+        bot.ledger.on_fill(BUY, l0_buy.qty, l0_buy.price, mid, clock.t, True)
+        self.assertGreater(bot.ledger.spread_capture, D("0"), "Spread capture must be strictly positive")
+        self.assertGreater(bot.ledger.avg_edge_bps, D("0"), "Average edge bps must be strictly positive")
+
+        print(f"✓ test_27_positive_spread_capture_and_no_mid_crossing passed: All quotes strictly respect mid and capture positive spread.")
+
+
+    async def test_28_arcus_taker_tif_and_good_til_signing(self):
+        """Verify Arcus documentation specification: TIF_IOC=2, FOK=1, GTT=0, ALO=3 and valid goodTilTime signing."""
+        from signer import Signer
+        s = Signer('11' * 32, '0xAbCdEf0123456789aBcDeF0123456789AbCdEf01', 0)
+        self.assertEqual(s.TIF_GTT, 0, 'Arcus TIF GTT must be 0')
+        self.assertEqual(s.TIF_FOK, 1, 'Arcus TIF FOK must be 1')
+        self.assertEqual(s.TIF_IOC, 2, 'Arcus TIF IOC must be 2')
+        self.assertEqual(s.TIF_ALO, 3, 'Arcus TIF ALO must be 3')
+
+        m = sim.Market(1, 'BTC-USD', 'ONLINE', D('0.1'), D('0.0001'), [], D('5'), D('0.0001'), D('100000'), D('80000.0'), False)
+        good_til = 1750000000000000
+        req = s.place(m, BUY, D('80010.0'), D('0.001'), good_til, time_in_force='IOC', reduce_only=True)
+        self.assertEqual(req['payload']['timeInForce'], 'IOC')
+        self.assertEqual(req['payload']['orderType'], 'LIMIT')
+        self.assertTrue(req['payload']['reduceOnly'])
+        self.assertEqual(req['payload']['goodTilTime'], str(good_til))
+
+        # Check binary typed message
+        import json
+        msg = s._typed(s.OP_PLACE, 123456789, m.market_id, g=good_til * 1000, p=800100, q=10, r=1, s=0, t=s.TIF_IOC)
+        msg_dict = json.loads(msg)
+        self.assertEqual(msg_dict['t'], 2, 'Signed IOC message t must be 2 (not 1 / FOK)')
+        self.assertEqual(msg_dict['r'], 1, 'Signed message r must be 1 for reduce_only')
+        self.assertEqual(msg_dict['g'], good_til * 1000, 'Signed message g must be nanoseconds')
+        print('✓ test_28_arcus_taker_tif_and_good_til_signing passed: Arcus TIF=2 and goodTilTime verified.')
+
+    async def test_29_order_manager_taker_slot_isolation_and_terminal_cleanup(self):
+        """Verify that IOC taker orders never occupy pair_slots and are cleaned up immediately on terminal states."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=1, ORDER_USD=20, MAX_POSITION_USD=100)
+        await sim.step(bot, s, clock, '80000.0', '80080.0')
+
+        self.assertIn((0, SELL), bot.om.pair_slots)
+
+        from engine import QuoteTarget
+        taker_target = QuoteTarget(pair_index=0, side=SELL, price=D('79990.0'), qty=D('0.001'),
+                                   expected_value_bps=D('-2.0'), fill_probability=1.0,
+                                   is_exit_quote=True, is_taker=True, quote_mid=D('80040.0'))
+
+        await bot.om.sync_quotes([taker_target], clock.t)
+        self.assertNotIn((0, SELL), bot.om.pair_slots, 'IOC taker order must NOT occupy pair_slots!')
+
+        # Verify no phantom errors on subsequent sync_quotes
+        await bot.om.sync_quotes([], clock.t)
+        self.assertEqual(bot.om._consec_errors, 0, 'No 404 errors or ghost modifications after IOC taker order')
+        print('✓ test_29_order_manager_taker_slot_isolation_and_terminal_cleanup passed: Taker isolation and clean lifecycle verified.')
+
+    async def test_30_taker_order_depth_slippage_and_execution_pricing(self):
+        """Verify that taker orders cross the order book with slippage buffer instead of being stuck at passive touch."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 ENABLE_SMART_INVENTORY_MGMT=1, EMERGENCY_TAKER_LOSS_BPS='6.0')
+        m = sim.Market(1, 'BTC-USD', 'ONLINE', D('0.1'), D('0.0001'), [], D('5'), D('0.0001'), D('100000'), D('80000.0'), False)
+        bot.md.info = m
+        bot.ledger.position = D('0.001')
+        bot.ledger.avg_cost = D('80000.0')
+        # Price drops to 79900 (loss > 6 bps)
+        bot.md.update(D('79900.0'), D('79920.0'), D('0.1'), D('2.0'), clock.t)
+        quotes = bot.engine.generate_ladder_quotes(m, bot.md, bot.ledger, clock.t, False, False)
+        t_quotes = [q for q in quotes if getattr(q, 'is_taker', False)]
+        self.assertEqual(len(t_quotes), 1, 'Emergency taker cut should generate exactly 1 taker quote')
+        t_q = t_quotes[0]
+        self.assertEqual(t_q.side, SELL)
+        self.assertLess(t_q.price, bot.md.bid, 'SELL taker order must cross below bid to guarantee execution')
+        print(f'✓ test_30_taker_order_depth_slippage_and_execution_pricing passed: Taker price {t_q.price} crosses bid {bot.md.bid}.')
+
+    async def test_31_spread_capture_strictly_positive_across_unwind_and_ladder(self):
+        """Verify all maker quotes strictly maintain positive spread capture and positive edge bps upon fill."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=2, ORDER_USD=20, MAX_POSITION_USD=100, GUARANTEE_SPREAD_CAPTURE=1)
+        m = sim.Market(1, 'BTC-USD', 'ONLINE', D('0.1'), D('0.0001'), [], D('5'), D('0.0001'), D('100000'), D('80000.0'), False)
+        bot.md.info = m
+
+        for pos in [D('-0.0005'), D('0'), D('0.0005')]:
+            bot.ledger.position = pos
+            bot.ledger.avg_cost = D('80000.0')
+            bot.md.update(D('79980.0'), D('80020.0'), D('10'), D('10'), clock.t)
+            mid = bot.md.mid
+            quotes = bot.engine.generate_ladder_quotes(m, bot.md, bot.ledger, clock.t, False, False)
+            for q in quotes:
+                if not getattr(q, 'is_taker', False):
+                    if q.side == BUY:
+                        self.assertLess(q.price, mid, f'BUY quote {q.price} must be < mid {mid}')
+                        edge = mid - q.price
+                        self.assertGreater(edge, D(0), f'BUY edge must be > 0, got {edge}')
+                    else:
+                        self.assertGreater(q.price, mid, f'SELL quote {q.price} must be > mid {mid}')
+                        edge = q.price - mid
+                        self.assertGreater(edge, D(0), f'SELL edge must be > 0, got {edge}')
+
+        print('✓ test_31_spread_capture_strictly_positive_across_unwind_and_ladder passed: Positive spread capture verified.')
+
+    async def test_32_two_sided_quoting_and_positive_spread_on_funding_markets(self):
+        """Verify that on markets with positive funding rate, the bot quotes both sides symmetrically when flat,
+        does not accumulate negative inventory bias, and locks in strictly positive spread on roundtrip fills."""
+        from orders import Order
+        bot, s, clock = sim.make(ORDER_USD=20, MAX_POSITION_USD=100, ENABLE_SMART_INVENTORY_MGMT=1, ENABLE_FUNDING_CARRY=1)
+        m = sim.Market(1, "BTC-USD", "ONLINE", D("0.1"), D("0.0001"), [], D("5"), D("0.0001"), D("100000"), D("80000.0"), False)
+        m.funding_rate = D("0.0005") # 5 bps positive funding rate
+        bot.md.info = m
+
+        # 1. Flat state: Bot must quote both bids and asks
+        bot.md.update(D("80000.0"), D("80010.0"), D("1.0"), D("1.0"), clock.t)
+        quotes = bot.engine.generate_ladder_quotes(m, bot.md, bot.ledger, clock.t, False, False)
+        bids = [q for q in quotes if q.side == BUY]
+        asks = [q for q in quotes if q.side == SELL]
+        self.assertGreater(len(bids), 0, "Bot must place bids when flat despite positive funding rate")
+        self.assertGreater(len(asks), 0, "Bot must place asks when flat despite positive funding rate")
+
+        # 2. Fill ask: Bot enters short
+        sell_q = asks[0]
+        bot._on_fill(SELL, sell_q.qty, sell_q.price, Order("s1", 0, SELL, sell_q.price, sell_q.qty, sell_q.qty, 0, clock.t, clock.t, quote_mid=D("80005.0")))
+        self.assertEqual(bot.ledger.position, -sell_q.qty)
+
+        # 3. Unwind quote must be at profitable touch
+        clock.t += 1.0
+        bot.md.update(D("80000.0"), D("80010.0"), D("1.0"), D("1.0"), clock.t)
+        unwind_quotes = bot.engine.generate_ladder_quotes(m, bot.md, bot.ledger, clock.t, False, False)
+        unwind_buys = [q for q in unwind_quotes if q.side == BUY]
+        self.assertGreater(len(unwind_buys), 0, "Must place unwind buy quote")
+        self.assertLessEqual(unwind_buys[0].price, D("80000.0"), "Unwind quote must not cross bid")
+
+        # 4. Fill unwind buy: Locks in positive spread and PnL
+        buy_q = unwind_buys[0]
+        bot._on_fill(BUY, buy_q.qty, buy_q.price, Order("b1", 0, BUY, buy_q.price, buy_q.qty, buy_q.qty, 0, clock.t, clock.t, quote_mid=D("80005.0")))
+        self.assertEqual(bot.ledger.position, D(0), "Bot must be flat after roundtrip")
+        self.assertGreater(bot.ledger.realized, D(0), "Realized PnL must be strictly positive")
+        self.assertGreater(bot.ledger.spread_capture, D(0), "Spread capture must be strictly positive")
+        print("✓ test_32_two_sided_quoting_and_positive_spread_on_funding_markets passed: Balanced quoting and positive spread verified.")
+
+    async def test_33_ultra_thin_liquid_market_spread_capture_and_touch_quoting(self):
+        """Verify that on ultra-thin liquid markets (e.g. 0.1 bps spread), the bot quotes directly at the touch,
+        does not offset quotes 100+ ticks away, and completes round-trips capturing positive spread."""
+        from orders import Order
+        bot, s, clock = sim.make(ORDER_USD=20, MAX_POSITION_USD=100, EXTRA_LEVELS=1)
+        m = sim.Market(1, "BTC-USD", "ONLINE", D("0.1"), D("0.0001"), [], D("5"), D("0.0001"), D("100000"), D("80000.0"), False)
+        bot.md.info = m
+
+        bot.md.update(D("80000.0"), D("80000.8"), D("10.0"), D("10.0"), clock.t)
+        quotes = bot.engine.generate_ladder_quotes(m, bot.md, bot.ledger, clock.t, False, False)
+        
+        bids = [q for q in quotes if q.side == BUY]
+        asks = [q for q in quotes if q.side == SELL]
+        self.assertGreaterEqual(len(bids), 1, "Must quote bids on liquid market")
+        self.assertGreaterEqual(len(asks), 1, "Must quote asks on liquid market")
+        
+        # Level 0 must be at the touch
+        self.assertEqual(bids[0].price, D("80000.0"), "L0 bid must be at touch 80000.0")
+        self.assertEqual(asks[0].price, D("80000.8"), "L0 ask must be at touch 80000.8")
+        
+        # Fill buy at bid:
+        bot._on_fill(BUY, bids[0].qty, bids[0].price, Order("b1", 0, BUY, bids[0].price, bids[0].qty, bids[0].qty, 0, clock.t, clock.t, quote_mid=D("80000.4")))
+        
+        # Check unwind sell quote at ask:
+        clock.t += 0.5
+        bot.md.update(D("80000.0"), D("80000.8"), D("10.0"), D("10.0"), clock.t)
+        unwind_quotes = bot.engine.generate_ladder_quotes(m, bot.md, bot.ledger, clock.t, False, False)
+        unwind_sells = [q for q in unwind_quotes if q.side == SELL]
+        self.assertGreater(len(unwind_sells), 0, "Must place unwind sell quote")
+        self.assertEqual(unwind_sells[0].price, D("80000.8"), "Unwind sell must be at market ask 80000.8")
+        
+        # Fill unwind sell:
+        bot._on_fill(SELL, unwind_sells[0].qty, unwind_sells[0].price, Order("s1", 0, SELL, unwind_sells[0].price, unwind_sells[0].qty, unwind_sells[0].qty, 0, clock.t, clock.t, quote_mid=D("80000.4")))
+        self.assertEqual(bot.ledger.position, D(0), "Position should be flat")
+        self.assertGreater(bot.ledger.realized, D(0), "Realized PnL must be strictly positive")
+        self.assertGreater(bot.ledger.spread_capture, D(0), "Spread capture must be strictly positive")
+        print("✓ test_33_ultra_thin_liquid_market_spread_capture_and_touch_quoting passed: Direct touch quoting and spread capture verified.")
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeadMansSwitch(unittest.IsolatedAsyncioTestCase):
+    async def test_34_schedule_cancel_signing_and_refresh(self):
+        """scheduleCancel is signed with legacy scheme (ts+action+canonical body) and refreshed by the bot."""
+        import time as _t
+        from utils import canonical
+        bot, s, clock = sim.make()
+        req = bot.signer.schedule_cancel(sim.MKT, int((_t.time() + 30) * 1e6))
+        self.assertEqual(req["type"], "scheduleCancel")
+        p = req["payload"]
+        self.assertEqual(set(p), {"address", "accountIndex", "marketId", "time"})
+        msg = f"{req['timestamp']}scheduleCancel{canonical(p)}".encode()
+        bot.signer.priv.public_key().verify(bytes.fromhex(req["signature"]), msg)  # raises if wrong
+        self.assertNotIn("time", bot.signer.schedule_cancel(sim.MKT, None)["payload"])  # disarm
+
+        seen = []
+        orig = s._post
+        def spy(m):
+            seen.append(m["request"]["type"])
+            if m["request"]["type"] == "scheduleCancel":
+                s._reply({"id": m["id"], "status": 200, "result": {"status": "scheduled"}})
+            else:
+                orig(m)
+        s._post = spy
+        await bot._heartbeat(clock.t)
+        self.assertIn("scheduleCancel", seen)
+        self.assertTrue(bot._dms_armed)
+        n = len(seen)
+        await bot._heartbeat(clock.t + 1)   # inside refresh interval -> no extra call
+        self.assertEqual(len(seen), n)
+        print("✓ test_34_schedule_cancel passed: signed correctly, armed, refresh throttled.")
+
+
+# ============================================================================ #
+# Cross-venue feeds (Binance / Bybit) + signals
+# ============================================================================ #
+import json as _json
+import feeds as _feeds
+from market import CrossVenueTracker
+
+
+class _Sink:
+    def __init__(self):
+        self.bbo, self.depth, self.trades, self.liqs, self.disc = [], [], [], [], []
+    def on_external_venue_bbo(self, v, b, a, bs, as_): self.bbo.append((v, b, a, bs, as_))
+    def on_external_depth(self, v, b, a): self.depth.append((v, b, a))
+    def on_external_trade(self, v, side, sz, px): self.trades.append((v, side, sz, px))
+    def on_external_liq(self, v, side, sz, px): self.liqs.append((v, side, sz, px))
+    def on_external_disconnect(self, v): self.disc.append(v)
+
+
+class TestCrossVenueFeeds(unittest.TestCase):
+    def test_35_binance_parsing(self):
+        sk = _Sink()
+        f = _feeds.BinanceFeed(sk, "SOLUSDT", "wss://x")
+        self.assertIn("solusdt@bookTicker", f.full_url())
+        self.assertIn("solusdt@depth10@100ms", f.full_url())
+        f.handle(_json.dumps({"stream": "solusdt@bookTicker", "data": {"e": "bookTicker", "s": "SOLUSDT",
+                              "b": "100.10", "B": "5", "a": "100.12", "A": "7"}}))
+        f.handle(_json.dumps({"stream": "x", "data": {"e": "depthUpdate", "b": [["100.10", "5"]], "a": [["100.12", "7"]]}}))
+        f.handle(_json.dumps({"data": {"e": "aggTrade", "p": "100.1", "q": "2", "m": True}}))    # aggressor SELL
+        f.handle(_json.dumps({"data": {"e": "aggTrade", "p": "100.1", "q": "3", "m": False}}))   # aggressor BUY
+        f.handle(_json.dumps({"data": {"e": "forceOrder", "o": {"S": "SELL", "q": "400", "z": "400", "p": "99", "ap": "99.5"}}}))
+        self.assertEqual(sk.bbo[0], ("BINANCE", D("100.10"), D("100.12"), D("5"), D("7")))
+        self.assertEqual(len(sk.depth), 1)
+        self.assertEqual([t[1] for t in sk.trades], ["SELL", "BUY"])
+        self.assertEqual(sk.liqs[0][:2], ("BINANCE", "SELL"))
+        self.assertEqual(sk.liqs[0][3], D("99.5"))
+        print("✓ test_35 passed: Binance bookTicker/depth/aggTrade/forceOrder parsed with correct aggressor sides.")
+
+    def test_36_bybit_book_delta_and_sides(self):
+        sk = _Sink()
+        f = _feeds.BybitFeed(sk, "SOLUSDT", "wss://x")
+        snap = {"topic": "orderbook.50.SOLUSDT", "type": "snapshot", "data": {"s": "SOLUSDT", "u": 5,
+                "b": [["100.0", "4"], ["99.9", "6"]], "a": [["100.2", "3"], ["100.3", "9"]]}}
+        f.handle(_json.dumps(snap))
+        self.assertEqual(sk.bbo[-1][1:3], (D("100.0"), D("100.2")))
+        # delta: new better bid, delete best ask, update 2nd level
+        f.handle(_json.dumps({"topic": "orderbook.50.SOLUSDT", "type": "delta", "data": {"u": 6,
+                 "b": [["100.1", "2"]], "a": [["100.2", "0"], ["100.3", "8"]]}}))
+        self.assertEqual(sk.bbo[-1][1:3], (D("100.1"), D("100.3")))
+        self.assertEqual(sk.depth[-1][2][0], ("100.3", "8"))
+        # crossed (out-of-sync) book is ignored
+        n = len(sk.bbo)
+        f.handle(_json.dumps({"topic": "orderbook.50.SOLUSDT", "type": "delta", "data": {"u": 7, "b": [["100.5", "1"]], "a": []}}))
+        self.assertEqual(len(sk.bbo), n)
+        f.handle(_json.dumps({"topic": "publicTrade.SOLUSDT", "data": [{"S": "Buy", "v": "2", "p": "100.1"},
+                                                                       {"S": "Sell", "v": "1", "p": "100.0"}]}))
+        self.assertEqual([t[1] for t in sk.trades], ["BUY", "SELL"])
+        # long position liquidated (Bybit side=Buy) => forced SELL
+        f.handle(_json.dumps({"topic": "liquidation.SOLUSDT", "data": {"side": "Buy", "size": "50", "price": "99"}}))
+        self.assertEqual(sk.liqs[-1][1], "SELL")
+        self.assertEqual(_feeds.derive_symbol("SOL-USD"), "SOLUSDT")
+        self.assertEqual(_feeds.derive_symbol("PEPE-USD", "1000pepeusdt"), "1000PEPEUSDT")
+        print("✓ test_36 passed: Bybit snapshot/delta/delete, crossed-book guard, trade & liquidation sides.")
+
+    def test_37_basis_lead_stale_and_no_venue_mixing(self):
+        cr = CrossVenueTracker()
+        t = 0.0
+        loc = D("100")
+        # Binance trades 5bps ABOVE arcus (USDT premium), Bybit 3bps above - constant offsets
+        for i in range(200):
+            t += 0.25
+            cr.update_venue("BINANCE", loc * D("1.0005") - D("0.005"), loc * D("1.0005") + D("0.005"), D(1), D(1), t)
+            cr.update_venue("BYBIT", loc * D("1.0003") - D("0.005"), loc * D("1.0003") + D("0.005"), D(1), D(1), t)
+            cr.observe_local(loc, t)
+        self.assertLess(abs(cr.lead_lag_divergence_bps(loc, t)), D("0.3"), "constant basis must be removed")
+        self.assertLess(abs(cr.cross_velocity_bps(3.0, t)), D("0.01"), "two flat venues at different prices => zero velocity")
+        # real lead: both venues jump +4bps, arcus unchanged
+        t += 0.25
+        for v, k in (("BINANCE", "1.0009"), ("BYBIT", "1.0007")):
+            cr.update_venue(v, loc * D(k) - D("0.005"), loc * D(k) + D("0.005"), D(1), D(1), t)
+        div = cr.lead_lag_divergence_bps(loc, t)
+        self.assertGreater(div, D("3.0"))
+        blk_buy, blk_sell, why = cr.pull_decision(loc, t, 2.5, 99.0, 0)
+        self.assertTrue(blk_sell and not blk_buy, "ext above arcus => our ask is stale => pull ask")
+        # consensus: only ONE venue moves => no pull
+        cr2 = CrossVenueTracker()
+        t2 = 0.0
+        for i in range(200):
+            t2 += 0.25
+            cr2.update_venue("BINANCE", loc - D("0.005"), loc + D("0.005"), D(1), D(1), t2)
+            cr2.update_venue("BYBIT", loc - D("0.005"), loc + D("0.005"), D(1), D(1), t2)
+            cr2.observe_local(loc, t2)
+        t2 += 0.25
+        cr2.update_venue("BINANCE", loc * D("0.9995") - D("0.005"), loc * D("0.9995") + D("0.005"), D(1), D(1), t2)
+        cr2.update_venue("BYBIT", loc - D("0.005"), loc + D("0.005"), D(1), D(1), t2)
+        self.assertEqual(cr2.pull_decision(loc, t2, 2.5, 99.0, 0)[:2], (False, False))
+        # staleness: silent venues stop influencing anything
+        self.assertEqual(cr.lead_lag_divergence_bps(loc, t + 5.0), D("0"))
+        self.assertEqual(cr.cross_obi(t + 5.0), D("0"))
+        # disconnect drops the venue immediately
+        cr.drop_venue("BINANCE")
+        self.assertNotIn("BINANCE", cr.venues)
+        print("✓ test_37 passed: basis removed, real lead detected, consensus required, stale/disconnect safe.")
+
+    def test_38_flow_liquidation_depth(self):
+        cr = CrossVenueTracker()
+        t = 10.0
+        cr.update_trade("BINANCE", "SELL", D(500), D(100), t)       # $50k aggressive selling
+        cr.update_trade("BYBIT", "BUY", D(50), D(100), t)           # $5k buying
+        self.assertLess(cr.cross_tfi(3.0, t), D("-0.4"))
+        cr.update_trade("BINANCE", "BUY", D(1), D(100), t - 0.0)
+        self.assertEqual(cr.cross_tfi(3.0, t + 10), D("0"))         # outside window
+        cr.update_liquidation("BINANCE", "SELL", D(1000), D(100), t)   # $100k longs liquidated
+        down, up = cr.liq_pressure_usd(5.0, t)
+        self.assertEqual((down, up), (100000.0, 0.0))
+        self.assertEqual(cr.pull_decision(D(100), t, 99.0, 99.0, 50000.0)[:2], (True, False))
+        cr.update_depth("BINANCE", [["100", "10"], ["99.9", "10"]], [["100.1", "1"], ["100.2", "1"]], t)
+        self.assertGreater(cr.venues["BINANCE"].obi, D("0.7"))
+        print("✓ test_38 passed: external trade flow, liquidation pull, depth-weighted OBI.")
+
+
+class TestCrossFeedLoop(unittest.IsolatedAsyncioTestCase):
+    async def test_39_reconnect_resubscribe_and_disconnect_callback(self):
+        sk = _Sink()
+        sent, conns = [], []
+
+        class FakeWS:
+            def __init__(self, msgs): self.msgs = list(msgs)
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def send(self, m): sent.append(m)
+            async def recv(self):
+                if self.msgs:
+                    return self.msgs.pop(0)
+                await asyncio.sleep(10)      # idle -> triggers idle timeout reconnect
+
+        def connect(url):
+            conns.append(url)
+            return FakeWS([_json.dumps({"topic": "publicTrade.SOLUSDT", "data": [{"S": "Buy", "v": "1", "p": "100"}]})])
+
+        f = _feeds.BybitFeed(sk, "SOLUSDT", "wss://fake", connect)
+        f.idle_timeout_s = 0.05
+        task = asyncio.create_task(f.run())
+        await asyncio.sleep(1.6)       # first reconnect backoff is 1s
+        f.stop(); task.cancel()
+        try: await task
+        except asyncio.CancelledError: pass
+        self.assertGreaterEqual(len(conns), 2, "must reconnect after idle")
+        subs = [m for m in sent if '"subscribe"' in m]
+        self.assertGreaterEqual(len(subs), 2, "must resubscribe on every connect")
+        self.assertIn("orderbook.50.SOLUSDT", subs[0])
+        self.assertIn("BYBIT", sk.disc)
+        self.assertGreaterEqual(len(sk.trades), 2)
+        print("✓ test_39 passed: idle->reconnect, resubscribe, disconnect callback clears venue.")
+
+    async def test_40_bot_pulls_stale_bid_when_external_venues_drop(self):
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ENABLE_CROSS_EXCHANGE=1, CROSS_WARMUP_S="5", CROSS_PULL_BPS="2.5",
+                                 CROSS_VEL_PULL_BPS="50")
+        def ext(px_mult):
+            for v in ("BINANCE", "BYBIT"):
+                mid = D("80050") * D(px_mult)
+                bot.on_external_venue_bbo(v, mid - D("2"), mid + D("2"))
+        for _ in range(40):                                  # 10s of calm: learns basis (+3bps USDT premium)
+            ext("1.0003")
+            await sim.step(bot, s, clock, "80000.0", "80100.0")
+        self.assertIsNotNone(bot.om.get_order_by_slot(0, BUY), "bid quoted in calm market")
+        self.assertLess(abs(bot.md.cross.lead_lag_divergence_bps(bot.md.mid, clock.t)), D("0.5"))
+        ext("0.9995")                                        # both venues drop ~8bps vs learned basis; arcus stale
+        await sim.step(bot, s, clock, "80000.0", "80100.0")
+        self.assertIsNone(bot.om.get_order_by_slot(0, BUY), "stale bid must be pulled")
+        self.assertIsNotNone(bot.om.get_order_by_slot(0, SELL), "ask on the safe side is kept")
+        print("✓ test_40 passed: bot pulled the stale bid ahead of Arcus repricing (ask kept).")
+
+
+class TestBybitSubscriptionFix(unittest.IsolatedAsyncioTestCase):
+    async def test_41_bybit_subscribes_separately_and_survives_bad_liquidation_topic(self):
+        sk = _Sink()
+        sent = []
+        class WS:
+            async def send(self, m): sent.append(_json.loads(m))
+        f = _feeds.BybitFeed(sk, "PUMPUSDT", "wss://x")
+        await f.on_open(WS())
+        self.assertEqual(sent[0]["args"], ["orderbook.50.PUMPUSDT", "publicTrade.PUMPUSDT"])
+        self.assertEqual(sent[1]["args"], ["allLiquidation.PUMPUSDT"])   # separate request
+        # exchange rejects the liquidation topic: price feed must NOT be disabled; legacy topic tried once
+        f.handle(_json.dumps({"success": False, "ret_msg": "error:handler not found,topic:allLiquidation.PUMPUSDT", "op": "subscribe"}))
+        self.assertFalse(f.disabled)
+        self.assertEqual(f._resub, ["liquidation.PUMPUSDT"])
+        f.handle(_json.dumps({"success": False, "ret_msg": "error:handler not found,topic:liquidation.PUMPUSDT", "op": "subscribe"}))
+        self.assertFalse(f.disabled)
+        # price data still flows
+        f.handle(_json.dumps({"topic": "orderbook.50.PUMPUSDT", "type": "snapshot", "data": {"u": 3,
+                 "b": [["0.0057", "100"]], "a": [["0.0058", "100"]]}}))
+        self.assertEqual(len(sk.bbo), 1)
+        # new allLiquidation payload (S=Buy => long liquidated => forced SELL)
+        f.handle(_json.dumps({"topic": "allLiquidation.PUMPUSDT", "data": [{"T": 1, "s": "PUMPUSDT", "S": "Buy", "v": "1000", "p": "0.0057"}]}))
+        self.assertEqual(sk.liqs[-1][1], "SELL")
+        # a bad ORDERBOOK subscription (symbol not listed) disables the feed instead of reconnect-looping
+        f.handle(_json.dumps({"success": False, "ret_msg": "error:handler not found,topic:orderbook.50.PUMPUSDT", "op": "subscribe"}))
+        self.assertTrue(f.disabled)
+        print("✓ test_41 passed: Bybit liquidation rejection no longer kills the price feed.")
