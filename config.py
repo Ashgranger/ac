@@ -90,6 +90,11 @@ class Config:
     max_hold_s: float
 
     # --- adverse-selection guards ------------------------------------------ #
+    stall_restart_s: float
+    pos_resync_s: float
+    ws_stale_s: float
+    ws_ping_interval_s: float
+    ws_ping_timeout_s: float
     trend_window_s: float
     trend_pull_bps: Decimal
     trend_widen: Decimal
@@ -146,6 +151,11 @@ class Config:
     adv_obi_exit: bool
     exclude_own_orders: bool
     market_refresh_s: float
+    enable_taker_exits: bool
+    maker_exit_first: bool
+    maker_exit_slack_bps: Decimal
+    maker_exit_min_prob: float
+    taker_hard_stop_bps: Decimal
     oracle_guard: bool
     oracle_guard_bps: Decimal
     enable_dynamic_sizing: bool
@@ -261,6 +271,11 @@ class Config:
             exit_min_profit_bps=_d("EXIT_MIN_PROFIT_BPS", "1.5"),
             stress_loss_bps=_d("STRESS_LOSS_BPS", "20"),
             max_hold_s=float(_e("MAX_HOLD_S", 120)),
+            stall_restart_s=float(_e("STALL_RESTART_S", 900)),
+            pos_resync_s=float(_e("POS_RESYNC_S", 30)),            # REST position check cadence (0 = off)
+            ws_stale_s=float(_e("WS_STALE_S", 25)),                # no frame at all for this long -> reconnect
+            ws_ping_interval_s=float(_e("WS_PING_INTERVAL_S", 10)),
+            ws_ping_timeout_s=float(_e("WS_PING_TIMEOUT_S", 15)),
             trend_window_s=float(_e("TREND_WINDOW_S", 5)),
             trend_pull_bps=_d("TREND_PULL_BPS", "2.5"),
             trend_widen=_d("TREND_WIDEN", "1"),
@@ -311,6 +326,11 @@ class Config:
             adv_obi_exit=_b("ADV_OBI_EXIT", "0"),
             exclude_own_orders=_b("EXCLUDE_OWN_ORDERS", "0"),
             market_refresh_s=float(_e("MARKET_REFRESH_S", "5")),
+            enable_taker_exits=_b("ENABLE_TAKER_EXITS", "1"),
+            maker_exit_first=_b("MAKER_EXIT_FIRST", "0"),
+            maker_exit_slack_bps=_d("MAKER_EXIT_SLACK_BPS", "2.0"),
+            maker_exit_min_prob=float(_e("MAKER_EXIT_MIN_PROB", "0.55")),
+            taker_hard_stop_bps=_d("TAKER_HARD_STOP_BPS", "0"),
             oracle_guard=_b("ORACLE_GUARD", "0"),
             oracle_guard_bps=_d("ORACLE_GUARD_BPS", "3.0"),
             enable_dynamic_sizing=_b("ENABLE_DYNAMIC_SIZING", "0"),
