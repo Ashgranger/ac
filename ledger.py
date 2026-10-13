@@ -31,64 +31,6 @@ class Fill:
     realized_delta: Decimal
 
 
-
-class ConditionalMarkoutModel:
-    """Empirical Bayesian conditional markout prediction model.
-    Learns E[markout | side, regime, level, horizon] with shrinkage toward prior.
-    """
-    def __init__(self, prior_weight: int = 5, ttl_s: float = 3600.0):
-        self.prior_weight = prior_weight
-        # Samples older than ttl_s are ignored. Without this, a run of adverse fills makes the predicted
-        # markout negative -> EV < MIN_EV -> bot stops quoting -> no new fills -> the stale samples can
-        # never be replaced, so quoting stays dead until the process is restarted.
-        self.ttl_s = float(ttl_s)
-        self.history: dict[tuple, list[float]] = {}
-        self.stamps: dict[tuple, list[float]] = {}
-        self.priors = {
-            ("BUY", "REGIME_A_QUIET", 0): Decimal("0.5"),
-            ("SELL", "REGIME_A_QUIET", 0): Decimal("0.5"),
-            ("BUY", "REGIME_B_HIGH_VOL", 0): Decimal("-0.5"),
-            ("SELL", "REGIME_B_HIGH_VOL", 0): Decimal("-0.5"),
-            ("BUY", "REGIME_C_TREND", 0): Decimal("-1.0"),
-            ("SELL", "REGIME_C_TREND", 0): Decimal("-1.0"),
-            ("BUY", "REGIME_D_TOXIC", 0): Decimal("-2.5"),
-            ("SELL", "REGIME_D_TOXIC", 0): Decimal("-2.5"),
-        }
-
-    def record(self, side: str, regime: str, level: int, horizon: float, markout_bps: float) -> None:
-        key = (side, regime, level, round(horizon, 1))
-        if key not in self.history:
-            self.history[key] = []
-        self.history[key].append(markout_bps)
-        st = self.stamps.setdefault(key, [])
-        while len(st) < len(self.history[key]) - 1:      # history filled directly (tests/old state): treat as fresh
-            st.append(time.time())
-        st.append(time.time())
-        if len(self.history[key]) > 100:
-            self.history[key].pop(0)
-            st.pop(0)
-
-    def predict(self, side: str, regime: str, level: int, horizon: float = 2.0) -> Decimal:
-        key = (side, regime, level, round(horizon, 1))
-        samples = self.history.get(key, [])
-        st = self.stamps.get(key, [])
-        # Only a key that has received NO new sample for ttl_s is reset to its prior (== what a restart does).
-        # While fills keep arriving the full history is used exactly as before, so protection against
-        # genuinely toxic flow is unchanged.
-        if samples and self.ttl_s > 0 and st and (time.time() - st[-1]) > self.ttl_s:
-            self.history[key] = []
-            self.stamps[key] = []
-            samples = []
-        prior = self.priors.get((side, regime, level), Decimal("0.0"))
-
-        n = len(samples)
-        if n == 0:
-            return prior
-
-        sample_mean = Decimal(str(sum(samples) / n))
-        w = Decimal(str(n)) / (Decimal(str(n)) + Decimal(str(self.prior_weight)))
-        return w * sample_mean + (Decimal("1") - w) * prior
-
 class OnlineLearner:
     """Level 7+ Autonomous Online Learning Engine.
     Dynamically modulates ALL market making environment parameters, microstructural
@@ -126,14 +68,10 @@ class OnlineLearner:
         }
 
         self._last_decay_ts: Optional[float] = None
-        self._last_feedback_ts: float = 0.0
-        self._uncommitted_updates: int = 0
-        self.markout_model = ConditionalMarkoutModel(prior_weight=int(getattr(cfg, "empirical_prior_weight", 5)),
-                                                     ttl_s=float(getattr(cfg, "markout_model_ttl_s", 3600.0)))
 
         # Hard mathematical & safety bounds [min_val, max_val]
         self.bounds = {
-            "min_edge_bps": (max(Decimal("0.2"), self.base["min_edge_bps"]), Decimal("6.0")),
+            "min_edge_bps": (Decimal("0.2"), Decimal("6.0")),
             "max_edge_bps": (Decimal("2.0"), Decimal("20.0")),
             "skew_bps": (Decimal("0.5"), Decimal("35.0")),
             "level_spacing_bps": (Decimal("1.0"), Decimal("15.0")),
@@ -149,8 +87,8 @@ class OnlineLearner:
             "trend_pull_bps": (Decimal("0.5"), Decimal("10.0")),
             "trend_widen": (Decimal("0.2"), Decimal("4.0")),
             "exit_min_profit_bps": (Decimal("0.5"), Decimal("10.0")),
-            "stress_loss_bps": (min(Decimal("10.0"), self.base["stress_loss_bps"]), max(Decimal("60.0"), self.base["stress_loss_bps"])),
-            "max_hold_s": (min(Decimal("60.0"), self.base["max_hold_s"]), max(Decimal("1200.0"), self.base["max_hold_s"])),
+            "stress_loss_bps": (Decimal("10.0"), Decimal("60.0")),
+            "max_hold_s": (Decimal("60.0"), Decimal("1200.0")),
             "burst_fills": (Decimal("2"), Decimal("5")),
             "burst_cooldown_s": (Decimal("10.0"), Decimal("90.0")),
             "sweep_guard_fills": (Decimal("2"), Decimal("4")),
@@ -311,16 +249,16 @@ class OnlineLearner:
         self.last_change_reason = reason
         self.last_changes = [f"{name}: {float(old):.2f} -> {float(new):.2f}" for name, old, new in diffs]
 
-        if log.isEnabledFor(logging.DEBUG):
-            lines = ["LEARN"]
-            for name, old, new in diffs:
-                lines.append(f"{name + ':':<8} {float(old):.2f} -> {float(new):.2f}")
-            lines.append(f"{'reason:':<8} {reason}")
-            if context:
-                for k, val in context.items():
-                    lines.append(f"{k}: {val}")
-            nl = chr(10)
-            log.debug(nl + nl.join(lines))
+        lines = ["LEARN"]
+        for name, old, new in diffs:
+            lines.append(f"{name + ':':<8} {float(old):.2f} -> {float(new):.2f}")
+        lines.append(f"{'reason:':<8} {reason}")
+        if context:
+            for k, val in context.items():
+                lines.append(f"{k}: {val}")
+
+        nl = chr(10)
+        log.info(nl + nl.join(lines))
 
     def tick_decay(self, now: float) -> None:
         """Gradually relaxes learned parameters toward base config during idle/no-fill periods."""
@@ -329,17 +267,13 @@ class OnlineLearner:
         if self._last_decay_ts is None:
             self._last_decay_ts = now
             return
-        # Only decay if at least 10s of quiet time without active fills or markouts
-        if self._last_feedback_ts > 0 and (now - self._last_feedback_ts < 10.0):
-            self._last_decay_ts = now
-            return
         dt = now - self._last_decay_ts
         if dt <= 0:
             return
         self._last_decay_ts = now
 
         old_params = dict(self.params)
-        decay_factor = Decimal(str(math.exp(-dt / 60.0)))
+        decay_factor = Decimal(str(math.exp(-dt / 45.0)))
         for k in self.params:
             if k in self.base:
                 diff = self.params[k] - self.base[k]
@@ -358,14 +292,11 @@ class OnlineLearner:
         if self.params["max_edge_bps"] < self.params["min_edge_bps"] + Decimal("2.0"):
             self.params["max_edge_bps"] = min(self.bounds["max_edge_bps"][1], self.params["min_edge_bps"] + Decimal("2.0"))
 
-    def on_markout(self, m_bps: Decimal, side: str, tox_bps: Decimal, horizon: float = 5.0,
-                   now: Optional[float] = None, regime: str = "REGIME_A_QUIET") -> None:
+    def on_markout(self, m_bps: Decimal, side: str, tox_bps: Decimal, horizon: float = 5.0) -> None:
         """Adapts edges, spreads, spacing, EV cutoffs, and adverse defenses based on markout evaluation."""
         if not self.enabled:
             return
 
-        self._last_feedback_ts = now if now is not None else time.time()
-        self.markout_model.record(side, regime, 0, horizon, float(m_bps))
         self.n_markouts += 1
         self.total_learned_updates += 1
         old_params = dict(self.params)
@@ -420,21 +351,12 @@ class OnlineLearner:
         self._clamp_all()
         ctx = {f"markout_{h_str}": f"{float(m_bps):+.2f}bps"}
         self._log_param_diff(reason, old_params, ctx)
-        self.save_soon()
+        self.save()
 
-
-    def predict_markout(self, side: str, regime: str, level: int = 0, horizon: float = 2.0) -> Decimal:
-        """Empirical prediction of expected post-fill markout in basis points conditional on market state."""
-        if not getattr(self.cfg, "enable_empirical_learner", True):
-            return ZERO
-        return self.markout_model.predict(side, regime, level, horizon)
-
-    def on_fill(self, side: str, price: Decimal, mid: Decimal, pos_usd: Decimal, hold_s: float,
-                now: Optional[float] = None) -> None:
+    def on_fill(self, side: str, price: Decimal, mid: Decimal, pos_usd: Decimal, hold_s: float) -> None:
         """Adapts inventory skew, risk aversion, and fill-probability kappa upon execution."""
         if not self.enabled:
             return
-        self._last_feedback_ts = now if now is not None else time.time()
 
         self.n_fills += 1
         self.total_learned_updates += 1
@@ -466,7 +388,7 @@ class OnlineLearner:
 
         self._clamp_all()
         self._log_param_diff(reason, old_params, ctx)
-        self.save_soon()
+        self.save()
 
     def on_flow_correlation(self, obi: Decimal, tfi: Decimal, ret_bps: Decimal) -> None:
         """Adapts order-book and trade-flow imbalance weights based on forward price prediction accuracy."""
@@ -509,7 +431,7 @@ class OnlineLearner:
             reason = "turnover_healthy_margin"
         self._clamp_all()
         self._log_param_diff(reason, old_params, {"realized_bps": f"{float(realized_bps):.2f}"})
-        self.save_soon()
+        self.save()
 
     def get_summary(self) -> Dict[str, Any]:
         return {
@@ -524,24 +446,6 @@ class OnlineLearner:
             "last_change_reason": self.last_change_reason,
             "params": {k: f"{v:.4f}" for k, v in self.params.items()},
         }
-
-    save_interval: float = 0.0  # 0 = save immediately (default); bot sets >0 for live trading
-
-    def save_soon(self, interval: Optional[float] = None) -> None:
-        """Throttled save: never blocks the hot path more than once per `interval`."""
-        if interval is None:
-            interval = self.save_interval
-        t = time.monotonic()
-        if t - getattr(self, "_last_save_t", 0.0) >= interval:
-            self._last_save_t = t
-            self._save_dirty = False
-            self.save()
-        else:
-            self._save_dirty = True
-
-    def flush(self) -> None:
-        if getattr(self, "_save_dirty", False):
-            self.save_soon()
 
     def save(self, path: Optional[str] = None) -> bool:
         """Persists learned parameters atomically to disk."""
@@ -592,8 +496,6 @@ class OnlineLearner:
                 for k, v in data["params"].items():
                     if k in self.params:
                         self.params[k] = Decimal(str(v))
-                if "min_edge_bps" in self.params:
-                    self.params["min_edge_bps"] = max(self.params["min_edge_bps"], self.base["min_edge_bps"])
                 self.n_markouts = int(data.get("n_markouts", 0))
                 self.n_toxic = int(data.get("n_toxic", 0))
                 self.n_benign = int(data.get("n_benign", 0))
@@ -631,11 +533,6 @@ class Ledger:
         self.markouts_5s: deque = deque(maxlen=cfg.markout_window * 2)
         self.latest_markout_1s: Optional[Decimal] = None
         self.latest_markout_5s: Optional[Decimal] = None
-        self.markouts_500ms: deque = deque(maxlen=cfg.markout_window * 2)
-        self.markouts_2s: deque = deque(maxlen=cfg.markout_window * 2)
-        self.latest_markout_500ms: Optional[Decimal] = None
-        self.latest_markout_2s: Optional[Decimal] = None
-        self.funding_pnl: Decimal = ZERO
         self._mismatch = 0
         self.last_now: float = time.time()
         self.learner = OnlineLearner(cfg)
@@ -651,11 +548,7 @@ class Ledger:
         return (mark - self.avg_cost) * self.position if self.position != 0 else ZERO
 
     def total_pnl(self, mark: Decimal) -> Decimal:
-        return self.realized + self.unrealized(mark) + getattr(self, "funding_pnl", ZERO)
-
-    def apply_funding(self, pmt: Decimal) -> None:
-        """Applies a funding payment (+ for received, - for paid)."""
-        self.funding_pnl += pmt
+        return self.realized + self.unrealized(mark)
 
     def inventory_pnl(self, mark: Decimal) -> Decimal:
         return self.total_pnl(mark) - self.spread_capture
@@ -691,9 +584,8 @@ class Ledger:
 
         edge = (mid - price) if side == BUY else (price - mid)
         edge_bps = edge / mid * BPS if mid else ZERO
-        if is_maker:
-            self.spread_capture += edge * qty
-            self.spread_edge_bps_sum += edge_bps
+        self.spread_capture += edge * qty
+        self.spread_edge_bps_sum += edge_bps
         self.volume_usd += qty * price
         self.n_fills += 1
         self.n_buys += (side == BUY)
@@ -709,15 +601,13 @@ class Ledger:
         self.last_now = now
         f = Fill(now, side, qty, price, mid, edge_bps, self.position, realized_delta)
         self.fills.append(f)
-        self._pending_markouts.append((now + 0.5, f, 0.5))
         self._pending_markouts.append((now + 1.0, f, 1.0))
-        self._pending_markouts.append((now + 2.0, f, 2.0))
         self._pending_markouts.append((now + 5.0, f, 5.0))
         h = float(getattr(self.cfg, "markout_horizon_s", 5.0))
         if abs(h - 1.0) > 0.05 and abs(h - 5.0) > 0.05:
             self._pending_markouts.append((now + h, f, h))
         self._pending_markouts.sort(key=lambda x: x[0])
-        self.learner.on_fill(side, price, mid, self.position * mid, self.hold_s(now), now=now)
+        self.learner.on_fill(side, price, mid, self.position * mid, self.hold_s(now))
         return f
 
     def _now(self) -> float:
@@ -730,19 +620,9 @@ class Ledger:
     def _calc_weighted_markout(self, buf: deque) -> Decimal:
         if not buf:
             return ZERO
-        now = self._now()
-        memo = self.__dict__.setdefault("_wm_memo", {})
-        last = buf[-1]
-        hit = memo.get(id(buf))
-        if hit is not None and hit[0] == now and hit[1] == len(buf) and hit[2] is last:
-            return hit[3]
-        res = self._calc_weighted_markout_raw(buf, now)
-        memo[id(buf)] = (now, len(buf), last, res)
-        return res
-
-    def _calc_weighted_markout_raw(self, buf: deque, now: float) -> Decimal:
         weighted_sum = ZERO
         weight_total = ZERO
+        now = self._now()
         for item in buf:
             if isinstance(item, tuple):
                 ts, val = item
@@ -767,45 +647,21 @@ class Ledger:
             m = (mid - f.price) if f.side == BUY else (f.price - mid)
             m_bps = m / f.price * BPS
 
-            if abs(horizon - 0.5) < 0.05:
-                self.markouts_500ms.append((now, m_bps))
-                self.latest_markout_500ms = m_bps
-            elif abs(horizon - 1.0) < 0.05:
+            if abs(horizon - 1.0) < 0.05:
                 self.markouts_1s.append((now, m_bps))
                 self.latest_markout_1s = m_bps
-            elif abs(horizon - 2.0) < 0.05:
-                self.markouts_2s.append((now, m_bps))
-                self.latest_markout_2s = m_bps
             elif abs(horizon - 5.0) < 0.05:
                 self.markouts_5s.append((now, m_bps))
                 self.latest_markout_5s = m_bps
 
-            cb = getattr(self, "on_markout_cb", None)
-            if cb is not None:
-                try:
-                    cb(f, horizon, m_bps)
-                except Exception:
-                    pass
             self.markouts.append((now, m_bps))
             if f.side == BUY:
                 self.markouts_buy.append((now, m_bps))
             else:
                 self.markouts_sell.append((now, m_bps))
 
-            regime = "REGIME_D_TOXIC" if self.tox_bps >= Decimal("1.5") else "REGIME_A_QUIET"
-            if hasattr(self, "bot") and hasattr(self.bot, "md"):
-                regime = self.bot.md.detect_regime(now, self.tox_bps)
-
             if abs(horizon - h_cfg) < 0.05 or (abs(h_cfg - 1.0) > 0.05 and abs(horizon - 5.0) < 0.05):
-                self.learner.on_markout(m_bps, f.side, self.tox_bps, horizon=horizon, now=now, regime=regime)
-            else:
-                self.learner.markout_model.record(f.side, regime, 0, horizon, float(m_bps))
-
-    @staticmethod
-    def raw_mean_bps(buf) -> Decimal:
-        """Plain mean of the last stored markouts (no 60s decay, so it never reads 0 when idle)."""
-        vals = [(it[1] if isinstance(it, tuple) else it) for it in buf]
-        return (sum(vals, ZERO) / Decimal(len(vals))) if vals else ZERO
+                self.learner.on_markout(m_bps, f.side, self.tox_bps, horizon=horizon)
 
     @property
     def avg_markout_1s_bps(self) -> Decimal:
@@ -849,4 +705,3 @@ class Ledger:
             self.avg_cost = mid
         self.opened_ts = None if self.is_flat(mid, min_notional) else now
         return True
-
