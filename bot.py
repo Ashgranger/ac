@@ -14,7 +14,6 @@ from typing import Any, Optional
 
 from config import Config
 from exchange import Exchange
-from feeds import CrossFeedManager
 from market import Market, MarketData
 from signer import Signer
 from ledger import Ledger, Fill
@@ -66,15 +65,6 @@ class MarketMaker:
         self._last_logged_realized: Decimal = ZERO
         self._tick_lock = asyncio.Lock()
         self._dirty_evt = asyncio.Event()
-        self._bg_tasks: dict = {}
-        self._last_ext_wake = 0.0
-        self._cross_feeds = None
-        self._last_cross_log = 0.0
-        self._dms_armed = False
-        self._dms_fail = 0
-        self._dms_ok_until = 0.0
-        self._files: dict = {}
-        self._tick_on_trades = os.getenv("TICK_ON_TRADES", "1").strip().lower() in ("1", "true", "yes", "on")
 
     def _get_market(self) -> Market:
         if not self.md.info:
@@ -107,8 +97,6 @@ class MarketMaker:
                     self._handle_trade(tr, now)
             elif isinstance(contents, dict):
                 self._handle_trade(contents, now)
-            if self._tick_on_trades:
-                self._dirty_evt.set()
 
         elif channel in ("l2Orderbook", "l2OrderbookUpdates", "orderBook"):
             if isinstance(contents, dict):
@@ -156,35 +144,10 @@ class MarketMaker:
                 if pmt != ZERO:
                     self.ledger.apply_funding(pmt)
 
-    def _wake_throttled(self) -> None:
-        """External feeds can emit hundreds of msgs/s; wake the quote loop at most every 20ms."""
-        t = self.now()
-        if t - self._last_ext_wake >= 0.02:
-            self._last_ext_wake = t
-            self._dirty_evt.set()
-
     def on_external_venue_bbo(self, venue: str, bid: Decimal, ask: Decimal,
                               bid_sz: Decimal = Decimal("1"), ask_sz: Decimal = Decimal("1")) -> None:
-        if bid >= ask:
-            return
         self.md.update_cross_venue(venue, bid, ask, bid_sz, ask_sz, self.now())
-        self._wake_throttled()
-
-    def on_external_depth(self, venue: str, bids: list, asks: list) -> None:
-        self.md.update_cross_depth(venue, bids, asks, self.now())
-
-    def on_external_trade(self, venue: str, side: str, size: Decimal, price: Decimal) -> None:
-        self.md.update_cross_trade(venue, side, size, price, self.now())
-
-    def on_external_liq(self, venue: str, side: str, size: Decimal, price: Decimal) -> None:
-        self.md.update_cross_liq(venue, side, size, price, self.now())
-        log.warning("LIQUIDATION %s forced-%s %s @ %s (~$%s)", venue, side, size, price,
-                    f"{float(size * price):,.0f}")
         self._dirty_evt.set()
-
-    def on_external_disconnect(self, venue: str) -> None:
-        self.md.cross.drop_venue(venue)
-        log.warning("Cross-venue feed %s disconnected - its signals are disabled until it reconnects", venue)
 
     def _handle_trade(self, tr: dict, now: float) -> None:
         try:
@@ -236,28 +199,6 @@ class MarketMaker:
         self._journal(fill)
         self._dirty_evt.set()
 
-    def _fp(self, path: str):
-        fp = self._files.get(path)
-        if fp is None or fp.closed:
-            fp = open(path, "a", buffering=1)
-            self._files[path] = fp
-        return fp
-
-    def _close_files(self) -> None:
-        for fp in self._files.values():
-            try:
-                fp.close()
-            except Exception:
-                pass
-        self._files.clear()
-
-    def _spawn_bg(self, name: str, coro_fn, now: float) -> None:
-        """Run slow network housekeeping off the quoting loop (one in flight per name)."""
-        t = self._bg_tasks.get(name)
-        if t is not None and not t.done():
-            return
-        self._bg_tasks[name] = asyncio.create_task(coro_fn(now))
-
     def _journal(self, f: Fill) -> None:
         if not self.cfg.journal_path or self.cfg.journal_path == os.devnull:
             return
@@ -268,7 +209,8 @@ class MarketMaker:
             "fees": fmt(self.ledger.fees)
         }
         try:
-            self._fp(self.cfg.journal_path).write(json.dumps(row) + "\n")
+            with open(self.cfg.journal_path, "a") as fp:
+                fp.write(json.dumps(row) + "\n")
         except Exception:
             pass
 
@@ -300,7 +242,8 @@ class MarketMaker:
                     for q in targets
                 ]
             }
-            self._fp(self.cfg.quote_dataset_path).write(json.dumps(record) + chr(10))
+            with open(self.cfg.quote_dataset_path, "a") as fp:
+                fp.write(json.dumps(record) + chr(10))
         except Exception:
             pass
 
@@ -312,21 +255,12 @@ class MarketMaker:
             if hasattr(self.ledger, "learner") and (now - getattr(self, "_last_decay_call", 0.0) >= 1.0):
                 self._last_decay_call = now
                 self.ledger.learner.tick_decay(now)
-                self.ledger.learner.flush()
             m = self.md.info
             if not m:
                 return
 
             mid = self.md.mid
             if not mid or not self.md.bid or not self.md.ask:
-                return
-
-            if (self.cfg.dms_required and self.cfg.dms_enabled and not self.cfg.dry_run
-                    and now > self._dms_ok_until):
-                await self.om.cancel_all()
-                if now - self._last_pause_log["oracle"] > 30.0:
-                    self._last_pause_log["oracle"] = now
-                    log.error("DMS_REQUIRED=1 but dead man's switch is not armed - quoting paused")
                 return
 
             tot_pnl = self.ledger.total_pnl(mid)
@@ -389,19 +323,6 @@ class MarketMaker:
                 self._trend_blocked_until[SELL] = now + self.cfg.trend_hold_s
                 sell_blocked = True
 
-            if self.cfg.enable_cross_exchange and self.md.cross.venues:
-                cb, cs, why = self.md.cross.pull_decision(
-                    mid, now, self.cfg.cross_pull_bps, self.cfg.cross_vel_pull_bps, self.cfg.cross_liq_usd)
-                if cb:
-                    self._trend_blocked_until[BUY] = now + self.cfg.cross_pull_hold_s
-                    buy_blocked = True
-                if cs:
-                    self._trend_blocked_until[SELL] = now + self.cfg.cross_pull_hold_s
-                    sell_blocked = True
-                if (cb or cs) and now - self._last_cross_log > 5.0:
-                    self._last_cross_log = now
-                    log.info("CROSS PULL %s | %s", "BIDS" if cb and not cs else ("ASKS" if cs and not cb else "BOTH"), why)
-
             pos_usd = self.ledger.position * mid
             if self.cfg.enable_online_learning and self.md.mid:
                 ret_5s = self.md.ret_bps(5.0, now)
@@ -429,71 +350,11 @@ class MarketMaker:
             await self.om.sync_quotes(targets, now, blocked_sides=blocked_sides)
 
     async def _heartbeat(self, now: float) -> None:
-        """Arm/refresh the exchange-side dead man's switch (scheduleCancel) for our market."""
-        cfg = self.cfg
-        if cfg.dry_run or not cfg.dms_enabled or not self.md.info:
-            return
-        interval = min(cfg.heartbeat_s, cfg.dms_ttl_s / 3.0)
-        if now - self._last_heartbeat < interval:
+        if now - self._last_heartbeat < self.cfg.heartbeat_s:
             return
         self._last_heartbeat = now
         try:
-            deadline_us = int((time.time() + cfg.dms_ttl_s) * 1_000_000)
-            resp = await self.ex.write(self.signer.schedule_cancel(self.md.info, deadline_us))
-            ok = (isinstance(resp, dict) and resp.get("status") in (200, 202)
-                  and not resp.get("error"))
-            if ok:
-                if not self._dms_armed:
-                    log.info("Dead man's switch ARMED (market %s, ttl %.0fs, refresh every %.1fs)",
-                             self.md.info.name, cfg.dms_ttl_s, interval)
-                self._dms_armed = True
-                self._dms_fail = 0
-                self._dms_ok_until = now + cfg.dms_ttl_s
-                return
-            self._dms_fail += 1
-            if self._dms_fail in (1, 3) or self._dms_fail % 12 == 0:
-                log.error("DEAD MAN'S SWITCH NOT ARMED (attempt %d): status=%s %s",
-                          self._dms_fail, resp.get("status") if isinstance(resp, dict) else None,
-                          json.dumps(resp.get("error") if isinstance(resp, dict) else resp)[:300])
-        except Exception as e:
-            self._dms_fail += 1
-            log.error("dead man's switch refresh error: %s", e)
-
-    async def _graceful_cancel(self) -> None:
-        """Cancel everything while still connected; disarm the switch only if the book is verified empty
-        (otherwise leave it armed so the exchange pulls anything we missed)."""
-        for _t in self._bg_tasks.values():
-            if not _t.done():
-                _t.cancel()
-        try:
-            await self.om.cancel_all(force=True)
-        except Exception as e:
-            log.warning("graceful cancel_all error: %s", e)
-        if self.cfg.dry_run or not self.md.info:
-            return
-        try:
-            await asyncio.sleep(0.4)
-            res = await self.ex.get("orders", {"address": self.cfg.address, "accountIndex": self.cfg.account_index,
-                                                "marketId": self.md.info.market_id}, timeout=3.0)
-            rows = [r for r in (res or {}).get("openOrders", []) if isinstance(r, dict)
-                    and r.get("marketId") in (None, self.md.info.market_id)] if res is not None else None
-            if rows == []:
-                await self._disarm_dms()
-            elif rows is None:
-                log.warning("could not verify empty book on shutdown - leaving dead man's switch armed")
-            else:
-                log.warning("%d order(s) still open on shutdown - leaving dead man's switch armed", len(rows))
-        except Exception as e:
-            log.warning("shutdown verification error: %s", e)
-
-    async def _disarm_dms(self) -> None:
-        cfg = self.cfg
-        if cfg.dry_run or not cfg.dms_enabled or not self.md.info or not self._dms_armed:
-            return
-        try:
-            await self.ex.write(self.signer.schedule_cancel(self.md.info, None))
-            self._dms_armed = False
-            log.info("Dead man's switch disarmed")
+            await self.ex.call("post", {"type": "heartbeat", "payload": {}}, timeout=4.0)
         except Exception:
             pass
 
@@ -522,15 +383,6 @@ class MarketMaker:
                  regime, fmt(mid), fmt(self.md.spread_bps), fmt(self.md.obi), fmt(self.md.vol_bps),
                  fmt(self.ledger.position), fmt(self.ledger.unrealized(mid)),
                  fmt(self.ledger.total_pnl(mid)), self.om.describe(now))
-        if self.cfg.enable_cross_exchange and self.cfg.cross_feed:
-            cr = self.md.cross
-            fr = cr.fresh(now)
-            div = cr.lead_lag_divergence_bps(self.md.mid, now)
-            down, up = cr.liq_pressure_usd(30.0, now)
-            log.info("CROSS | venues=%s | div=%+.2fbps vel3s=%+.2fbps obi=%+.2f tfi5s=%+.2f disp=%.2fbps | liq30s sell=$%.0f buy=$%.0f",
-                     ",".join(v.venue for v in fr) or "NONE (feeds down - signals off)",
-                     float(div), float(cr.cross_velocity_bps(3.0, now)), float(cr.cross_obi(now)),
-                     float(cr.cross_tfi(5.0, now)), float(cr.cross_dispersion_bps(now)), down, up)
         if self.cfg.enable_online_learning:
             s = self.ledger.learner.get_summary()
             p = s["params"]
@@ -559,8 +411,6 @@ class MarketMaker:
                      m1s, m5s, m_avg, wr, afr, pnl_delta, inv_pnl_str, cap_spr, vol_str, fills_str)
 
     async def run(self) -> None:
-        if self.cfg.enable_online_learning and hasattr(self.ledger, "learner"):
-            self.ledger.learner.save_interval = 1.0  # keep disk I/O off the hot path
         log.info("Connecting to %s Arcus WS (%s)...", self.cfg.env_name, self.ex.ws_url)
         raw_markets = await self.ex.fetch_markets(self.cfg.market)
         self.md.info = Market.from_api(raw_markets[0])
@@ -579,10 +429,6 @@ class MarketMaker:
                 log.error("websockets package not available; install via pip install websockets")
                 return
 
-        if self.cfg.enable_cross_exchange and self.cfg.cross_feed and self._cross_feeds is None:
-            self._cross_feeds = CrossFeedManager(self.cfg, self)
-            self._cross_feeds.start()
-
         reconnect_delay = 1.0
         max_reconnect_delay = 15.0
 
@@ -595,8 +441,7 @@ class MarketMaker:
                     ping_interval=15,
                     ping_timeout=20,
                     max_size=2**23,
-                    close_timeout=5,
-                    compression=None
+                    close_timeout=5
                 ) as ws:
                     self.ex.ws = ws
                     reader_task = asyncio.create_task(self.ex.reader())
@@ -609,8 +454,6 @@ class MarketMaker:
                     await self.ex.subscribe("positions", self.cfg.address)
 
                     reconnect_delay = 1.0
-                    self._last_heartbeat = 0.0
-                    await self._heartbeat(self.now())  # arm before any quote is placed
 
                     if self.om.maybe_orders:
                         await self.om.cancel_all()
@@ -619,8 +462,8 @@ class MarketMaker:
 
                     while not self.stop_evt.is_set() and self.ex.is_connected:
                         now = self.now()
-                        self._spawn_bg("heartbeat", self._heartbeat, now)
-                        self._spawn_bg("reconcile", self._reconcile, now)
+                        await self._heartbeat(now)
+                        await self._reconcile(now)
                         self._status_log(now)
 
                         await self.tick()
@@ -631,17 +474,11 @@ class MarketMaker:
                         except asyncio.TimeoutError:
                             pass
 
-                    if self.stop_evt.is_set():
-                        await self._graceful_cancel()  # must happen while the socket is still open
-
             except (ConnectionClosed, ConnectionResetError, BrokenPipeError, OSError) as e:
                 log.warning("WebSocket connection dropped (%s). Reconnecting in %.1fs...", e, reconnect_delay)
             except Exception as e:
                 log.error("Error in bot run loop: %s", e, exc_info=True)
             finally:
-                for _t in self._bg_tasks.values():
-                    if not _t.done():
-                        _t.cancel()
                 if reader_task and not reader_task.done():
                     reader_task.cancel()
                     try:
@@ -662,9 +499,3 @@ class MarketMaker:
             await self.om.cancel_all()
         except Exception:
             pass
-        if self._cross_feeds is not None:
-            try:
-                await self._cross_feeds.stop()
-            except Exception:
-                pass
-        self._close_files()

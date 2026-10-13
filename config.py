@@ -43,18 +43,6 @@ def _parse_guarantee_spread_capture(name: str, default: str) -> tuple[bool, Deci
         return True, Decimal("0.5")
     return False, Decimal("0")
 
-def _parse_weights(raw: str) -> dict:
-    out = {}
-    for part in raw.split(","):
-        if ":" in part:
-            k, v = part.split(":", 1)
-            try:
-                out[k.strip().lower()] = float(v)
-            except ValueError:
-                pass
-    return out
-
-
 @dataclass
 class Config:
     # --- connection -------------------------------------------------------- #
@@ -173,9 +161,6 @@ class Config:
     max_actions_per_min: int
     loop_s: float
     heartbeat_s: float
-    dms_enabled: bool
-    dms_ttl_s: float
-    dms_required: bool
     reconcile_s: float
     status_s: float
     stale_s: float
@@ -183,26 +168,6 @@ class Config:
     max_oracle_dev_bps: Decimal
     quote_outside_rth: bool
     journal_path: str
-
-    # --- external venues (Binance / Bybit) ---------------------------------- #
-    cross_feed: bool = True
-    cross_venues: str = "binance,bybit"
-    binance_symbol: str = ""
-    bybit_symbol: str = ""
-    binance_ws_url: str = "wss://fstream.binance.com"
-    bybit_ws_url: str = "wss://stream.bybit.com/v5/public/linear"
-    cross_stale_s: float = 2.0
-    cross_basis_tau_s: float = 45.0
-    cross_warmup_s: float = 10.0
-    cross_max_shift_bps: float = 4.0
-    cross_flow_k_usd: float = 20000.0
-    cross_weights: dict = None
-    cross_pull_bps: float = 2.5
-    cross_vel_pull_bps: float = 3.0
-    cross_pull_hold_s: float = 1.5
-    cross_liq_usd: float = 50000.0
-    cross_div_adverse_mult: float = 1.0
-    cross_flow_weight: float = 0.3
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -308,9 +273,6 @@ class Config:
             max_actions_per_min=int(_e("MAX_ACTIONS_PER_MIN", 40)),
             loop_s=float(_e("LOOP_S", 0.25)),
             heartbeat_s=float(_e("HEARTBEAT_S", 5)),
-            dms_enabled=_b("DMS_ENABLED", "1"),
-            dms_ttl_s=min(300.0, max(6.0, float(_e("DMS_TTL_S", 30)))),
-            dms_required=_b("DMS_REQUIRED", "0"),
             reconcile_s=float(_e("RECONCILE_S", 5)),
             status_s=float(_e("STATUS_S", 15)),
             stale_s=float(_e("STALE_S", 15)),
@@ -318,24 +280,6 @@ class Config:
             max_oracle_dev_bps=_d("MAX_ORACLE_DEV_BPS", "150"),
             quote_outside_rth=_b("QUOTE_OUTSIDE_RTH", "0"),
             journal_path=str(_e("JOURNAL_PATH", f"fills_{'paper' if dry else 'live'}_{market}.jsonl")),
-            cross_feed=_b("CROSS_FEED", "1"),
-            cross_venues=str(_e("CROSS_VENUES", "binance,bybit")).lower(),
-            binance_symbol=str(_e("BINANCE_SYMBOL", "")).upper(),
-            bybit_symbol=str(_e("BYBIT_SYMBOL", "")).upper(),
-            binance_ws_url=str(_e("BINANCE_WS_URL", "wss://fstream.binance.com")).rstrip("/"),
-            bybit_ws_url=str(_e("BYBIT_WS_URL", "wss://stream.bybit.com/v5/public/linear")),
-            cross_stale_s=float(_e("CROSS_STALE_S", 2.0)),
-            cross_basis_tau_s=float(_e("CROSS_BASIS_TAU_S", 45)),
-            cross_warmup_s=float(_e("CROSS_WARMUP_S", 10)),
-            cross_max_shift_bps=float(_e("CROSS_MAX_SHIFT_BPS", 4.0)),
-            cross_flow_k_usd=float(_e("CROSS_FLOW_K_USD", 20000)),
-            cross_weights=_parse_weights(str(_e("CROSS_WEIGHTS", "binance:1.0,bybit:0.8"))),
-            cross_pull_bps=float(_e("CROSS_PULL_BPS", 2.5)),
-            cross_vel_pull_bps=float(_e("CROSS_VEL_PULL_BPS", 3.0)),
-            cross_pull_hold_s=float(_e("CROSS_PULL_HOLD_S", 1.5)),
-            cross_liq_usd=float(_e("CROSS_LIQ_USD", 50000)),
-            cross_div_adverse_mult=float(_e("CROSS_DIV_ADVERSE_MULT", 1.0)),
-            cross_flow_weight=float(_e("CROSS_FLOW_WEIGHT", 0.3)),
         )
         if cfg.max_position_usd < cfg.order_usd:
             raise Fatal("MAX_POSITION_USD must be >= ORDER_USD")
