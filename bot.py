@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 from config import Config
 from exchange import Exchange
+from feeds import CrossFeedManager
 from market import Market, MarketData
 from signer import Signer
 from ledger import Ledger, Fill
@@ -65,6 +66,15 @@ class MarketMaker:
         self._last_logged_realized: Decimal = ZERO
         self._tick_lock = asyncio.Lock()
         self._dirty_evt = asyncio.Event()
+        self._bg_tasks: dict = {}
+        self._last_ext_wake = 0.0
+        self._cross_feeds = None
+        self._last_cross_log = 0.0
+        self._dms_armed = False
+        self._dms_fail = 0
+        self._dms_ok_until = 0.0
+        self._files: dict = {}
+        self._tick_on_trades = os.getenv("TICK_ON_TRADES", "1").strip().lower() in ("1", "true", "yes", "on")
 
     def _get_market(self) -> Market:
         if not self.md.info:
@@ -97,6 +107,8 @@ class MarketMaker:
                     self._handle_trade(tr, now)
             elif isinstance(contents, dict):
                 self._handle_trade(contents, now)
+            if self._tick_on_trades:
+                self._dirty_evt.set()
 
         elif channel in ("l2Orderbook", "l2OrderbookUpdates", "orderBook"):
             if isinstance(contents, dict):
@@ -134,10 +146,45 @@ class MarketMaker:
                         signed_pos = sz if side == "LONG" else (-sz if side == "SHORT" else ZERO)
                         self.ledger.reconcile(signed_pos, now, target_mid, m.min_notional)
 
+        elif channel in ("funding", "funding_rate", "fundingRate"):
+            if isinstance(contents, dict):
+                r = Decimal(str(contents.get("rate") or contents.get("fundingRate") or "0"))
+                if self.md.info:
+                    self.md.info.funding_rate = r
+                self.md.funding_rate = r
+                pmt = Decimal(str(contents.get("payment") or contents.get("fundingPayment") or "0"))
+                if pmt != ZERO:
+                    self.ledger.apply_funding(pmt)
+
+    def _wake_throttled(self) -> None:
+        """External feeds can emit hundreds of msgs/s; wake the quote loop at most every 20ms."""
+        t = self.now()
+        if t - self._last_ext_wake >= 0.02:
+            self._last_ext_wake = t
+            self._dirty_evt.set()
+
     def on_external_venue_bbo(self, venue: str, bid: Decimal, ask: Decimal,
                               bid_sz: Decimal = Decimal("1"), ask_sz: Decimal = Decimal("1")) -> None:
+        if bid >= ask:
+            return
         self.md.update_cross_venue(venue, bid, ask, bid_sz, ask_sz, self.now())
+        self._wake_throttled()
+
+    def on_external_depth(self, venue: str, bids: list, asks: list) -> None:
+        self.md.update_cross_depth(venue, bids, asks, self.now())
+
+    def on_external_trade(self, venue: str, side: str, size: Decimal, price: Decimal) -> None:
+        self.md.update_cross_trade(venue, side, size, price, self.now())
+
+    def on_external_liq(self, venue: str, side: str, size: Decimal, price: Decimal) -> None:
+        self.md.update_cross_liq(venue, side, size, price, self.now())
+        log.warning("LIQUIDATION %s forced-%s %s @ %s (~$%s)", venue, side, size, price,
+                    f"{float(size * price):,.0f}")
         self._dirty_evt.set()
+
+    def on_external_disconnect(self, venue: str) -> None:
+        self.md.cross.drop_venue(venue)
+        log.warning("Cross-venue feed %s disconnected - its signals are disabled until it reconnects", venue)
 
     def _handle_trade(self, tr: dict, now: float) -> None:
         try:
@@ -152,14 +199,15 @@ class MarketMaker:
     def _on_fill(self, side: str, qty: Decimal, price: Decimal, o: Order) -> None:
         now = self.now()
         m = self.md.info
-        mid = self.md.mid or price
+        mid = getattr(o, "quote_mid", None) or self.md.mid or price
         min_notional = m.min_notional if m else Decimal("5")
         
         is_maker = not getattr(o, "is_taker", False)
         fill = self.ledger.on_fill(side, qty, price, mid, now, min_notional, is_maker=is_maker)
+        current_mid = self.md.mid or price
         log.info("FILL L%d %s %s @ %s | edge=%sbps pos=%s pnl=$%s",
                  o.pair_index, side, fmt(qty), fmt(price), fmt(fill.edge_bps),
-                 fmt(self.ledger.position), fmt(self.ledger.total_pnl(mid)))
+                 fmt(self.ledger.position), fmt(self.ledger.total_pnl(current_mid)))
 
         self._recent_fills.append((now, side))
         while self._recent_fills and now - self._recent_fills[0][0] > self.cfg.burst_window_s:
@@ -188,6 +236,28 @@ class MarketMaker:
         self._journal(fill)
         self._dirty_evt.set()
 
+    def _fp(self, path: str):
+        fp = self._files.get(path)
+        if fp is None or fp.closed:
+            fp = open(path, "a", buffering=1)
+            self._files[path] = fp
+        return fp
+
+    def _close_files(self) -> None:
+        for fp in self._files.values():
+            try:
+                fp.close()
+            except Exception:
+                pass
+        self._files.clear()
+
+    def _spawn_bg(self, name: str, coro_fn, now: float) -> None:
+        """Run slow network housekeeping off the quoting loop (one in flight per name)."""
+        t = self._bg_tasks.get(name)
+        if t is not None and not t.done():
+            return
+        self._bg_tasks[name] = asyncio.create_task(coro_fn(now))
+
     def _journal(self, f: Fill) -> None:
         if not self.cfg.journal_path or self.cfg.journal_path == os.devnull:
             return
@@ -198,8 +268,39 @@ class MarketMaker:
             "fees": fmt(self.ledger.fees)
         }
         try:
-            with open(self.cfg.journal_path, "a") as fp:
-                fp.write(json.dumps(row) + "\n")
+            self._fp(self.cfg.journal_path).write(json.dumps(row) + "\n")
+        except Exception:
+            pass
+
+    def _log_quote_opportunity(self, targets: list[QuoteTarget], now: float) -> None:
+        if not getattr(self.cfg, "enable_quote_dataset", False) or not self.cfg.quote_dataset_path:
+            return
+        if self.cfg.quote_dataset_path == os.devnull:
+            return
+        try:
+            snapshot = self.md.get_microstructure_snapshot(self.md.info, now)
+            record = {
+                "ts": now,
+                "snapshot": snapshot,
+                "position": float(self.ledger.position),
+                "avg_cost": float(self.ledger.avg_cost),
+                "unrealized_pnl": float(self.ledger.unrealized(self.md.mid or Decimal(0))),
+                "realized_pnl": float(self.ledger.realized),
+                "quotes": [
+                    {
+                        "pair_index": q.pair_index,
+                        "side": q.side,
+                        "price": float(q.price),
+                        "qty": float(q.qty),
+                        "ev_bps": float(q.expected_value_bps),
+                        "p_fill": float(q.fill_probability),
+                        "is_exit": q.is_exit_quote,
+                        "is_taker": getattr(q, "is_taker", False)
+                    }
+                    for q in targets
+                ]
+            }
+            self._fp(self.cfg.quote_dataset_path).write(json.dumps(record) + chr(10))
         except Exception:
             pass
 
@@ -208,14 +309,24 @@ class MarketMaker:
             now = self.now()
             self.ledger.last_now = now
             self.ledger.current_now = now
-            if hasattr(self.ledger, "learner"):
+            if hasattr(self.ledger, "learner") and (now - getattr(self, "_last_decay_call", 0.0) >= 1.0):
+                self._last_decay_call = now
                 self.ledger.learner.tick_decay(now)
+                self.ledger.learner.flush()
             m = self.md.info
             if not m:
                 return
 
             mid = self.md.mid
             if not mid or not self.md.bid or not self.md.ask:
+                return
+
+            if (self.cfg.dms_required and self.cfg.dms_enabled and not self.cfg.dry_run
+                    and now > self._dms_ok_until):
+                await self.om.cancel_all()
+                if now - self._last_pause_log["oracle"] > 30.0:
+                    self._last_pause_log["oracle"] = now
+                    log.error("DMS_REQUIRED=1 but dead man's switch is not armed - quoting paused")
                 return
 
             tot_pnl = self.ledger.total_pnl(mid)
@@ -278,6 +389,19 @@ class MarketMaker:
                 self._trend_blocked_until[SELL] = now + self.cfg.trend_hold_s
                 sell_blocked = True
 
+            if self.cfg.enable_cross_exchange and self.md.cross.venues:
+                cb, cs, why = self.md.cross.pull_decision(
+                    mid, now, self.cfg.cross_pull_bps, self.cfg.cross_vel_pull_bps, self.cfg.cross_liq_usd)
+                if cb:
+                    self._trend_blocked_until[BUY] = now + self.cfg.cross_pull_hold_s
+                    buy_blocked = True
+                if cs:
+                    self._trend_blocked_until[SELL] = now + self.cfg.cross_pull_hold_s
+                    sell_blocked = True
+                if (cb or cs) and now - self._last_cross_log > 5.0:
+                    self._last_cross_log = now
+                    log.info("CROSS PULL %s | %s", "BIDS" if cb and not cs else ("ASKS" if cs and not cb else "BOTH"), why)
+
             pos_usd = self.ledger.position * mid
             if self.cfg.enable_online_learning and self.md.mid:
                 ret_5s = self.md.ret_bps(5.0, now)
@@ -295,6 +419,7 @@ class MarketMaker:
             targets = self.engine.generate_ladder_quotes(
                 m, self.md, self.ledger, now, buy_blocked, sell_blocked, existing_slots=existing_slots
             )
+            self._log_quote_opportunity(targets, now)
 
             blocked_sides = set()
             if buy_blocked:
@@ -304,11 +429,71 @@ class MarketMaker:
             await self.om.sync_quotes(targets, now, blocked_sides=blocked_sides)
 
     async def _heartbeat(self, now: float) -> None:
-        if now - self._last_heartbeat < self.cfg.heartbeat_s:
+        """Arm/refresh the exchange-side dead man's switch (scheduleCancel) for our market."""
+        cfg = self.cfg
+        if cfg.dry_run or not cfg.dms_enabled or not self.md.info:
+            return
+        interval = min(cfg.heartbeat_s, cfg.dms_ttl_s / 3.0)
+        if now - self._last_heartbeat < interval:
             return
         self._last_heartbeat = now
         try:
-            await self.ex.call("post", {"type": "heartbeat", "payload": {}}, timeout=4.0)
+            deadline_us = int((time.time() + cfg.dms_ttl_s) * 1_000_000)
+            resp = await self.ex.write(self.signer.schedule_cancel(self.md.info, deadline_us))
+            ok = (isinstance(resp, dict) and resp.get("status") in (200, 202)
+                  and not resp.get("error"))
+            if ok:
+                if not self._dms_armed:
+                    log.info("Dead man's switch ARMED (market %s, ttl %.0fs, refresh every %.1fs)",
+                             self.md.info.name, cfg.dms_ttl_s, interval)
+                self._dms_armed = True
+                self._dms_fail = 0
+                self._dms_ok_until = now + cfg.dms_ttl_s
+                return
+            self._dms_fail += 1
+            if self._dms_fail in (1, 3) or self._dms_fail % 12 == 0:
+                log.error("DEAD MAN'S SWITCH NOT ARMED (attempt %d): status=%s %s",
+                          self._dms_fail, resp.get("status") if isinstance(resp, dict) else None,
+                          json.dumps(resp.get("error") if isinstance(resp, dict) else resp)[:300])
+        except Exception as e:
+            self._dms_fail += 1
+            log.error("dead man's switch refresh error: %s", e)
+
+    async def _graceful_cancel(self) -> None:
+        """Cancel everything while still connected; disarm the switch only if the book is verified empty
+        (otherwise leave it armed so the exchange pulls anything we missed)."""
+        for _t in self._bg_tasks.values():
+            if not _t.done():
+                _t.cancel()
+        try:
+            await self.om.cancel_all(force=True)
+        except Exception as e:
+            log.warning("graceful cancel_all error: %s", e)
+        if self.cfg.dry_run or not self.md.info:
+            return
+        try:
+            await asyncio.sleep(0.4)
+            res = await self.ex.get("orders", {"address": self.cfg.address, "accountIndex": self.cfg.account_index,
+                                                "marketId": self.md.info.market_id}, timeout=3.0)
+            rows = [r for r in (res or {}).get("openOrders", []) if isinstance(r, dict)
+                    and r.get("marketId") in (None, self.md.info.market_id)] if res is not None else None
+            if rows == []:
+                await self._disarm_dms()
+            elif rows is None:
+                log.warning("could not verify empty book on shutdown - leaving dead man's switch armed")
+            else:
+                log.warning("%d order(s) still open on shutdown - leaving dead man's switch armed", len(rows))
+        except Exception as e:
+            log.warning("shutdown verification error: %s", e)
+
+    async def _disarm_dms(self) -> None:
+        cfg = self.cfg
+        if cfg.dry_run or not cfg.dms_enabled or not self.md.info or not self._dms_armed:
+            return
+        try:
+            await self.ex.write(self.signer.schedule_cancel(self.md.info, None))
+            self._dms_armed = False
+            log.info("Dead man's switch disarmed")
         except Exception:
             pass
 
@@ -337,6 +522,15 @@ class MarketMaker:
                  regime, fmt(mid), fmt(self.md.spread_bps), fmt(self.md.obi), fmt(self.md.vol_bps),
                  fmt(self.ledger.position), fmt(self.ledger.unrealized(mid)),
                  fmt(self.ledger.total_pnl(mid)), self.om.describe(now))
+        if self.cfg.enable_cross_exchange and self.cfg.cross_feed:
+            cr = self.md.cross
+            fr = cr.fresh(now)
+            div = cr.lead_lag_divergence_bps(self.md.mid, now)
+            down, up = cr.liq_pressure_usd(30.0, now)
+            log.info("CROSS | venues=%s | div=%+.2fbps vel3s=%+.2fbps obi=%+.2f tfi5s=%+.2f disp=%.2fbps | liq30s sell=$%.0f buy=$%.0f",
+                     ",".join(v.venue for v in fr) or "NONE (feeds down - signals off)",
+                     float(div), float(cr.cross_velocity_bps(3.0, now)), float(cr.cross_obi(now)),
+                     float(cr.cross_tfi(5.0, now)), float(cr.cross_dispersion_bps(now)), down, up)
         if self.cfg.enable_online_learning:
             s = self.ledger.learner.get_summary()
             p = s["params"]
@@ -356,15 +550,17 @@ class MarketMaker:
             vol_str = f"${float(self.ledger.volume_usd):.2f}"
             fills_str = f"{self.ledger.n_fills} ({self.ledger.n_buys}B/{self.ledger.n_sells}S)"
 
-            log.info("LEARN [updates=%d tox=%d] | edge=%.2f-%.2fbps skew=%.2fbps spacing=%.2fbps mult=%.2f vol_k=%.2f tox_mult=%.2f min_ev=%.2fbps obi_a=%.2f tfi_b=%.2f kappa=%.2f | markout_1s=%s markout_5s=%s avg_markout=%s | win_rate=%s adverse_fill_rate=%s | realized_pnl_delta=%s inventory_pnl=%s | capture_spread=%s volume=%s fills=%s | reason=%s",
+            log.info("LEARN [updates=%d tox=%d] | edge=%.2f-%.2fbps skew=%.2fbps spacing=%.2fbps mult=%.2f vol_k=%.2f tox_mult=%.2f min_ev=%.2fbps obi_a=%.2f tfi_b=%.2f kappa=%.2f | markout_1s=%s markout_5s=%s avg_markout=%s | win_rate=%s adverse_fill_rate=%s | realized_pnl_delta=%s inventory_pnl=%s | capture_spread=%s volume=%s fills=%s",
                      s["total_updates"], s["toxic_fills"],
                      float(p["min_edge_bps"]), float(p["max_edge_bps"]), float(p["skew_bps"]),
                      float(p["level_spacing_bps"]), float(p["level_size_mult"]), float(p["vol_k"]),
                      float(p["tox_mult"]), float(p["min_ev_bps"]), float(p["obi_alpha"]),
                      float(p["tfi_beta"]), float(p["fill_prob_kappa"]),
-                     m1s, m5s, m_avg, wr, afr, pnl_delta, inv_pnl_str, cap_spr, vol_str, fills_str, reason)
+                     m1s, m5s, m_avg, wr, afr, pnl_delta, inv_pnl_str, cap_spr, vol_str, fills_str)
 
     async def run(self) -> None:
+        if self.cfg.enable_online_learning and hasattr(self.ledger, "learner"):
+            self.ledger.learner.save_interval = 1.0  # keep disk I/O off the hot path
         log.info("Connecting to %s Arcus WS (%s)...", self.cfg.env_name, self.ex.ws_url)
         raw_markets = await self.ex.fetch_markets(self.cfg.market)
         self.md.info = Market.from_api(raw_markets[0])
@@ -375,43 +571,100 @@ class MarketMaker:
 
         try:
             import websockets
+            from websockets.exceptions import ConnectionClosed
         except ImportError:
-            log.error("websockets package not available; install via pip install websockets")
-            return
+            class ConnectionClosed(Exception):
+                pass
+            if not hasattr(self.ex, "ws") or self.ex.ws is None:
+                log.error("websockets package not available; install via pip install websockets")
+                return
 
-        async with websockets.connect(self.ex.ws_url, ping_interval=15, max_size=2**23) as ws:
-            self.ex.ws = ws
-            reader_task = asyncio.create_task(self.ex.reader())
+        if self.cfg.enable_cross_exchange and self.cfg.cross_feed and self._cross_feeds is None:
+            self._cross_feeds = CrossFeedManager(self.cfg, self)
+            self._cross_feeds.start()
 
-            await self.ex.subscribe("bbo", self.cfg.market)
-            await self.ex.subscribe("l2Orderbook", self.cfg.market)
-            await self.ex.subscribe("trades", self.cfg.market)
-            await self.ex.subscribe("orders", self.cfg.address)
-            await self.ex.subscribe("userFills", self.cfg.address)
-            await self.ex.subscribe("positions", self.cfg.address)
+        reconnect_delay = 1.0
+        max_reconnect_delay = 15.0
 
-            if self.om.maybe_orders:
-                await self.om.cancel_all()
+        while not self.stop_evt.is_set():
+            reader_task = None
+            try:
+                log.info("Connecting to Arcus WebSocket (%s)...", self.ex.ws_url)
+                async with websockets.connect(
+                    self.ex.ws_url,
+                    ping_interval=15,
+                    ping_timeout=20,
+                    max_size=2**23,
+                    close_timeout=5,
+                    compression=None
+                ) as ws:
+                    self.ex.ws = ws
+                    reader_task = asyncio.create_task(self.ex.reader())
 
-            log.info("Subscribed to data feeds. Level 7 MM Engine active.")
+                    await self.ex.subscribe("bbo", self.cfg.market)
+                    await self.ex.subscribe("l2Orderbook", self.cfg.market)
+                    await self.ex.subscribe("trades", self.cfg.market)
+                    await self.ex.subscribe("orders", self.cfg.address)
+                    await self.ex.subscribe("userFills", self.cfg.address)
+                    await self.ex.subscribe("positions", self.cfg.address)
 
-            while not self.stop_evt.is_set():
-                now = self.now()
-                await self._heartbeat(now)
-                await self._reconcile(now)
-                self._status_log(now)
+                    reconnect_delay = 1.0
+                    self._last_heartbeat = 0.0
+                    await self._heartbeat(self.now())  # arm before any quote is placed
 
-                await self.tick()
+                    if self.om.maybe_orders:
+                        await self.om.cancel_all()
 
-                try:
-                    await asyncio.wait_for(self._dirty_evt.wait(), timeout=self.cfg.loop_s)
-                    self._dirty_evt.clear()
-                except asyncio.TimeoutError:
-                    pass
+                    log.info("Subscribed to data feeds. Level 7 MM Engine active.")
 
-            log.info("Stopping bot - cancelling all resting orders...")
-            if self.cfg.enable_online_learning:
-                self.ledger.learner.save()
-                log.info("Saved online learning state to %s", self.cfg.learning_state_path)
+                    while not self.stop_evt.is_set() and self.ex.is_connected:
+                        now = self.now()
+                        self._spawn_bg("heartbeat", self._heartbeat, now)
+                        self._spawn_bg("reconcile", self._reconcile, now)
+                        self._status_log(now)
+
+                        await self.tick()
+
+                        try:
+                            await asyncio.wait_for(self._dirty_evt.wait(), timeout=self.cfg.loop_s)
+                            self._dirty_evt.clear()
+                        except asyncio.TimeoutError:
+                            pass
+
+                    if self.stop_evt.is_set():
+                        await self._graceful_cancel()  # must happen while the socket is still open
+
+            except (ConnectionClosed, ConnectionResetError, BrokenPipeError, OSError) as e:
+                log.warning("WebSocket connection dropped (%s). Reconnecting in %.1fs...", e, reconnect_delay)
+            except Exception as e:
+                log.error("Error in bot run loop: %s", e, exc_info=True)
+            finally:
+                for _t in self._bg_tasks.values():
+                    if not _t.done():
+                        _t.cancel()
+                if reader_task and not reader_task.done():
+                    reader_task.cancel()
+                    try:
+                        await reader_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                self.ex.ws = None
+
+            if not self.stop_evt.is_set():
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
+
+        log.info("Stopping bot - cancelling resting orders for market %s...", self.md.info.name if self.md.info else self.cfg.market)
+        if self.cfg.enable_online_learning:
+            self.ledger.learner.save()
+            log.info("Saved online learning state to %s", self.cfg.learning_state_path)
+        try:
             await self.om.cancel_all()
-            reader_task.cancel()
+        except Exception:
+            pass
+        if self._cross_feeds is not None:
+            try:
+                await self._cross_feeds.stop()
+            except Exception:
+                pass
+        self._close_files()
