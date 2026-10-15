@@ -1,5 +1,28 @@
-"""Small shared helpers (decimal maths, canonical JSON, logging)."""
 from __future__ import annotations
+
+
+# Enable direct file discovery on 9p filesystems
+import sys, os, importlib.util, importlib.abc
+
+class _DirectFileFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        mod_name = fullname.split('.')[-1]
+        search_paths = path if path is not None else sys.path
+        for p in search_paths:
+            if not p:
+                p = os.getcwd()
+            candidate = os.path.join(p, mod_name + '.py')
+            if os.path.isfile(candidate):
+                return importlib.util.spec_from_file_location(fullname, candidate)
+            cand_pkg = os.path.join(p, mod_name, '__init__.py')
+            if os.path.isfile(cand_pkg):
+                return importlib.util.spec_from_file_location(fullname, cand_pkg)
+        return None
+
+if not any(isinstance(finder, _DirectFileFinder) for finder in sys.meta_path):
+    sys.meta_path.insert(0, _DirectFileFinder())
+
+"""Small shared helpers (decimal maths, canonical JSON, logging)."""
 
 import json
 import logging
@@ -53,8 +76,19 @@ def bps_diff(a: Decimal, b: Decimal) -> Decimal:
 
 
 def setup_logging(level: str = "INFO") -> None:
+    """Dated timestamps (multi-day runs) + optional size-rotated file via LOG_FILE / LOG_MAX_MB / LOG_BACKUPS."""
+    import os
+    from logging.handlers import RotatingFileHandler
+    handlers = [logging.StreamHandler()]
+    path = os.getenv("LOG_FILE", "").strip()
+    if path:
+        mb = float(os.getenv("LOG_MAX_MB", "20"))
+        handlers.append(RotatingFileHandler(path, maxBytes=int(mb * 1024 * 1024),
+                                            backupCount=int(os.getenv("LOG_BACKUPS", "10")), encoding="utf-8"))
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)-7s %(message)s",
-        datefmt="%H:%M:%S"
+        datefmt="%m-%d %H:%M:%S",
+        handlers=handlers,
+        force=True,
     )

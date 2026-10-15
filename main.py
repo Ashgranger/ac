@@ -21,7 +21,7 @@ log = logging.getLogger("main")
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Arcus perp market maker (Level 7 Engine)")
-    ap.add_argument("cmd", nargs="?", default="run", choices=["run", "scan"])
+    ap.add_argument("cmd", nargs="?", default="run", choices=["run", "scan", "sim"])
     ap.add_argument("--live", action="store_true", help="send real orders (overrides DRY_RUN=1)")
     ap.add_argument("--env", choices=["mainnet", "testnet"], help="override ARCUS_ENV")
     ap.add_argument("--market", help="override MARKET")
@@ -52,6 +52,10 @@ def main() -> None:
         from scan import scan
         asyncio.run(scan(cfg, args.seconds))
         return
+    if args.cmd == "sim":
+        from sim import run_standalone_sim
+        asyncio.run(run_standalone_sim(steps=max(60, int(args.seconds * 10)), market_name=cfg.market))
+        return
 
     from bot import MarketMaker
     log.info("env=%s market=%s %s | order=$%s max_pos=$%s min_edge=%sbps skew=%sbps ladder_levels=%d "
@@ -71,7 +75,11 @@ def main() -> None:
                 signal.signal(sig, lambda *_: loop.call_soon_threadsafe(bot.stop_evt.set))
         await bot.run()
 
-    asyncio.run(_main())
+    try:
+        import uvloop
+        asyncio.run(_main(), loop_factory=uvloop.new_event_loop)
+    except ImportError:
+        asyncio.run(_main())
 
 
 if __name__ == "__main__":

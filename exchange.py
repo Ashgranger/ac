@@ -14,6 +14,14 @@ from utils import Fatal
 log = logging.getLogger("exchange")
 
 try:
+    import orjson as _orjson
+    _loads = _orjson.loads
+    _dumps = lambda o: _orjson.dumps(o).decode()
+except ImportError:  # graceful fallback
+    _loads = json.loads
+    _dumps = json.dumps
+
+try:
     from websockets.exceptions import ConnectionClosed
 except ImportError:
     class ConnectionClosed(Exception):
@@ -30,6 +38,7 @@ class Exchange:
         self._ids = itertools.count(1)
         self._pending: dict[int, asyncio.Future] = {}
         self._dry_seq = itertools.count(1)
+        self.rtt_ms: float = 10.0
 
     @property
     def is_connected(self) -> bool:
@@ -39,7 +48,7 @@ class Exchange:
         if not self.is_connected:
             return False
         try:
-            await self.ws.send(json.dumps(obj))
+            await self.ws.send(_dumps(obj))
             return True
         except (ConnectionClosed, ConnectionResetError, BrokenPipeError, OSError) as e:
             log.warning("WebSocket send failed (closed): %s", e)
@@ -60,13 +69,18 @@ class Exchange:
         if not self.is_connected and not self.cfg.dry_run:
             return {"status": 503, "error": {"type": "NOT_CONNECTED", "message": "WebSocket not connected"}}
         rid = next(self._ids)
-        fut = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
         self._pending[rid] = fut
+        t0 = loop.time()
         try:
             sent = await self._send({"type": kind, "id": rid, "request": request})
             if not sent and not self.cfg.dry_run:
                 return {"status": 503, "error": {"type": "CONNECTION_CLOSED", "message": "Failed to send over WebSocket"}}
-            return await asyncio.wait_for(fut, timeout)
+            resp = await asyncio.wait_for(fut, timeout)
+            dt_ms = max(0.5, (loop.time() - t0) * 1000.0)
+            self.rtt_ms = 0.80 * self.rtt_ms + 0.20 * dt_ms
+            return resp
         except asyncio.TimeoutError:
             return {"status": 408, "error": {"type": "TIMEOUT", "message": f"Request {kind} timed out after {timeout}s"}}
         except Exception as e:
@@ -92,8 +106,8 @@ class Exchange:
 
     def handle_message(self, raw) -> None:
         try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
+            msg = _loads(raw)
+        except ValueError:
             return
         mtype = msg.get("type")
         if mtype in ("channel_data", "subscribed"):
@@ -124,6 +138,32 @@ class Exchange:
         finally:
             self._fail_all_pending("CONNECTION_CLOSED")
             self.ws = None
+
+
+    async def fetch_account(self) -> Optional[dict]:
+        """REST GET /v1/account per Arcus documentation."""
+        def _get():
+            try:
+                url = f"{self.rest}/v1/account?address={self.cfg.address}&accountIndex={self.cfg.account_index}"
+                req = urllib.request.Request(url, headers={"User-Agent": "Arcus-MM/1.0"})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    return json.loads(r.read())
+            except Exception as e:
+                log.debug("fetch_account REST failed: %s", e)
+                return None
+        return await asyncio.to_thread(_get)
+
+    async def fetch_positions(self) -> Optional[dict]:
+        """REST GET /v1/positions fallback."""
+        def _get():
+            try:
+                url = f"{self.rest}/v1/positions?address={self.cfg.address}&accountIndex={self.cfg.account_index}"
+                req = urllib.request.Request(url, headers={"User-Agent": "Arcus-MM/1.0"})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    return json.loads(r.read())
+            except Exception:
+                return None
+        return await asyncio.to_thread(_get)
 
     async def fetch_markets(self, market: Optional[str] = None) -> list:
         def _get():
